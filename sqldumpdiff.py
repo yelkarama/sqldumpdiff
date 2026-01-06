@@ -5,6 +5,18 @@ import csv
 import os
 from tqdm import tqdm
 
+# Increase CSV field size limit to handle large TEXT/BLOB fields
+# Default limit is 131072 (128KB), increase to handle large fields
+try:
+    # Try to set to 100MB, fall back to maxsize if that fails
+    csv.field_size_limit(min(100 * 1024 * 1024, sys.maxsize))
+except (OverflowError, ValueError):
+    # If setting fails, try maxsize
+    try:
+        csv.field_size_limit(sys.maxsize)
+    except (OverflowError, ValueError):
+        pass  # Keep default limit if all else fails
+
 # Regex Patterns
 # Note: Both CREATE TABLE and INSERT statements now support multi-line parsing.
 # Note: INSERT_RE only matches single-row INSERTs. Multi-row INSERTs (VALUES (...), (...))
@@ -261,8 +273,11 @@ def generate_delta(old_file, new_file, delta_out=None):
         total_inserts = count_insert_statements(old_file)
         with open(old_file, 'r', encoding='utf-8') as f:
             insert_iter = parse_insert_statements(f)
+            # Always show progress bar, with or without total
             if total_inserts is not None:
                 insert_iter = tqdm(insert_iter, total=total_inserts, desc="Indexing old records", unit="inserts", file=progress_stream)
+            else:
+                insert_iter = tqdm(insert_iter, desc="Indexing old records", unit="inserts", file=progress_stream)
             
             for insert_stmt in insert_iter:
                 table, cols, data, _ = get_row_data(insert_stmt)
@@ -304,8 +319,11 @@ def generate_delta(old_file, new_file, delta_out=None):
             f_out.write("SET FOREIGN_KEY_CHECKS = 0;\n\n")
 
             insert_iter = parse_insert_statements(f_new)
+            # Always show progress bar, with or without total
             if total_inserts is not None:
                 insert_iter = tqdm(insert_iter, total=total_inserts, desc="Comparing records", unit="inserts", file=progress_stream)
+            else:
+                insert_iter = tqdm(insert_iter, desc="Comparing records", unit="inserts", file=progress_stream)
             
             for insert_stmt in insert_iter:
                 table, cols, new_data, original_stmt = get_row_data(insert_stmt)
