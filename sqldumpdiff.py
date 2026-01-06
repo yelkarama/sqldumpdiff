@@ -258,6 +258,11 @@ def generate_delta(old_file, new_file, delta_out):
 
     matched_old_keys = set()
 
+    # Initialize counters
+    insert_count = 0
+    update_count = 0
+    delete_count = 0
+
     # 3. Compare for Inserts and Updates
     print("Step 3: Comparing for Updates and Inserts...")
     try:
@@ -289,6 +294,7 @@ def generate_delta(old_file, new_file, delta_out):
                 if not old_data:
                     # This record is entirely new
                     f_out.write(f"-- NEW RECORD IN {table}\n{original_stmt}\n")
+                    insert_count += 1
                 else:
                     matched_old_keys.add((table, pk_values))
                     updates = []
@@ -309,6 +315,7 @@ def generate_delta(old_file, new_file, delta_out):
                         where_str = build_where_clause(pk_cols, new_data)
                         f_out.writelines(c + "\n" for c in comments)
                         f_out.write(f"UPDATE `{table}` SET {', '.join(updates)} WHERE {where_str};\n\n")
+                        update_count += 1
 
             # 4. Handle Deletions
             print("Step 4: Identifying Deletions...")
@@ -327,14 +334,25 @@ def generate_delta(old_file, new_file, delta_out):
                 where_str = build_where_clause(pk_cols, old_data)
                 f_out.write(f"-- DELETED FROM {table}: {pk_values}\n")
                 f_out.write(f"DELETE FROM `{table}` WHERE {where_str};\n\n")
+                delete_count += 1
 
             f_out.write("SET FOREIGN_KEY_CHECKS = 1;\n")
     except Exception as e:
         raise RuntimeError(f"Error processing new file or writing output: {e}") from e
+    
+    # Print summary
+    print("\n" + "="*60)
+    print("SUMMARY")
+    print("="*60)
+    print(f"Inserts:  {insert_count:,}")
+    print(f"Updates:  {update_count:,}")
+    print(f"Deletes: {delete_count:,}")
+    print(f"Total:    {insert_count + update_count + delete_count:,}")
+    print("="*60)
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
         print("Usage: python sqldiff.py <old_dump.sql> <new_dump.sql>")
     else:
         generate_delta(sys.argv[1], sys.argv[2], "full_delta_update.sql")
-        print("Done! Check 'full_delta_update.sql' for the results.")
+        print(f"\nDelta script written to: full_delta_update.sql")
