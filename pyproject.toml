@@ -1,0 +1,9 @@
+[project]
+name = "sqldumpdiff"
+version = "0.1.0"
+description = "Compare SQL dump files and generate delta update scripts"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "tqdm>=4.66.0",
+]
