@@ -3,6 +3,7 @@ import sys
 import io
 import csv
 import os
+from tqdm import tqdm
 
 # Regex Patterns
 # Note: Both CREATE TABLE and INSERT statements now support multi-line parsing.
@@ -11,7 +12,27 @@ import os
 TABLE_NAME_RE = re.compile(r"CREATE TABLE `(.+?)`", re.IGNORECASE)
 INSERT_RE = re.compile(r"INSERT INTO `(.+?)` \((.+?)\) VALUES \((.+?)\);", re.IGNORECASE)
 
-def get_table_schemas(filepath):
+def count_insert_statements(filepath):
+    """Counts the total number of INSERT statements in a file for progress tracking."""
+    count = 0
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            for _ in parse_insert_statements(f):
+                count += 1
+    except Exception:
+        # If counting fails, return None to indicate we can't show accurate progress
+        return None
+    return count
+
+def count_file_lines(filepath):
+    """Counts the total number of lines in a file for progress tracking."""
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            return sum(1 for _ in f)
+    except Exception:
+        return None
+
+def get_table_schemas(filepath, show_progress=False):
     """Parses the SQL file to find Primary Keys (including composite).
     Handles multi-line CREATE TABLE statements."""
     schema_map = {}
@@ -19,8 +40,13 @@ def get_table_schemas(filepath):
     table_content = []
     in_create_table = False
     
+    # Count lines for progress if requested
+    total_lines = count_file_lines(filepath) if show_progress else None
+    
     with open(filepath, 'r', encoding='utf-8') as f:
-        for line in f:
+        file_iter = tqdm(f, total=total_lines, desc="Parsing schemas", unit="lines", disable=not show_progress) if show_progress else f
+        
+        for line in file_iter:
             # Check if this line starts a CREATE TABLE
             table_match = TABLE_NAME_RE.search(line)
             if table_match:
@@ -42,10 +68,10 @@ def get_table_schemas(filepath):
                     current_table = None
                     table_content = []
                     in_create_table = False
-    
-    # Handle case where file ends without semicolon
-    if in_create_table and current_table:
-        _process_table_definition(current_table, ''.join(table_content), schema_map)
+        
+        # Handle case where file ends without semicolon
+        if in_create_table and current_table:
+            _process_table_definition(current_table, ''.join(table_content), schema_map)
     
     return schema_map
 
@@ -199,7 +225,7 @@ def generate_delta(old_file, new_file, delta_out):
     
     print("Step 1: Mapping Schemas from DDL...")
     try:
-        pk_map = get_table_schemas(new_file)
+        pk_map = get_table_schemas(new_file, show_progress=True)
     except Exception as e:
         raise RuntimeError(f"Error parsing schema from {new_file}: {e}") from e
     
@@ -210,8 +236,14 @@ def generate_delta(old_file, new_file, delta_out):
     old_records = {} 
     print("Step 2: Indexing old records...")
     try:
+        # Count INSERT statements for progress tracking
+        total_inserts = count_insert_statements(old_file)
         with open(old_file, 'r', encoding='utf-8') as f:
-            for insert_stmt in parse_insert_statements(f):
+            insert_iter = parse_insert_statements(f)
+            if total_inserts is not None:
+                insert_iter = tqdm(insert_iter, total=total_inserts, desc="Indexing old records", unit="inserts")
+            
+            for insert_stmt in insert_iter:
                 table, cols, data, _ = get_row_data(insert_stmt)
                 if table and table in pk_map:
                     pk_cols = pk_map[table]
@@ -229,13 +261,20 @@ def generate_delta(old_file, new_file, delta_out):
     # 3. Compare for Inserts and Updates
     print("Step 3: Comparing for Updates and Inserts...")
     try:
+        # Count INSERT statements for progress tracking
+        total_inserts = count_insert_statements(new_file)
+        
         with open(new_file, 'r', encoding='utf-8') as f_new, \
              open(delta_out, 'w', encoding='utf-8') as f_out:
             
             f_out.write("-- Full Delta Update Script\n")
             f_out.write("SET FOREIGN_KEY_CHECKS = 0;\n\n")
 
-            for insert_stmt in parse_insert_statements(f_new):
+            insert_iter = parse_insert_statements(f_new)
+            if total_inserts is not None:
+                insert_iter = tqdm(insert_iter, total=total_inserts, desc="Comparing records", unit="inserts")
+            
+            for insert_stmt in insert_iter:
                 table, cols, new_data, original_stmt = get_row_data(insert_stmt)
                 if not table or table not in pk_map:
                     continue
@@ -274,16 +313,20 @@ def generate_delta(old_file, new_file, delta_out):
             # 4. Handle Deletions
             print("Step 4: Identifying Deletions...")
             f_out.write("-- DELETIONS\n")
-            for key, old_data in old_records.items():
-                if key not in matched_old_keys:
-                    table, pk_values = key
-                    # Skip if table no longer exists in new schema
-                    if table not in pk_map:
-                        continue
-                    pk_cols = pk_map[table]
-                    where_str = build_where_clause(pk_cols, old_data)
-                    f_out.write(f"-- DELETED FROM {table}: {pk_values}\n")
-                    f_out.write(f"DELETE FROM `{table}` WHERE {where_str};\n\n")
+            
+            # Filter deletions first to get accurate count
+            deletions = [(key, old_data) for key, old_data in old_records.items() 
+                        if key not in matched_old_keys]
+            
+            for key, old_data in tqdm(deletions, desc="Writing deletions", unit="records", disable=len(deletions) == 0):
+                table, pk_values = key
+                # Skip if table no longer exists in new schema
+                if table not in pk_map:
+                    continue
+                pk_cols = pk_map[table]
+                where_str = build_where_clause(pk_cols, old_data)
+                f_out.write(f"-- DELETED FROM {table}: {pk_values}\n")
+                f_out.write(f"DELETE FROM `{table}` WHERE {where_str};\n\n")
 
             f_out.write("SET FOREIGN_KEY_CHECKS = 1;\n")
     except Exception as e:
