@@ -223,6 +223,10 @@ def generate_delta(old_file, new_file, delta_out=None):
         new_file: Path to the new SQL dump file
         delta_out: Path to output file (None means write to stdout)
     """
+    # Normalize file paths (resolve relative paths to absolute)
+    old_file = os.path.abspath(os.path.expanduser(old_file))
+    new_file = os.path.abspath(os.path.expanduser(new_file))
+    
     # Validate input files exist
     if not os.path.exists(old_file):
         raise FileNotFoundError(f"Old file not found: {old_file}")
@@ -231,7 +235,11 @@ def generate_delta(old_file, new_file, delta_out=None):
     
     # Determine output destination
     output_to_stdout = delta_out is None
-    output_file = sys.stdout if output_to_stdout else delta_out
+    if delta_out:
+        # Normalize output file path
+        output_file = os.path.abspath(os.path.expanduser(delta_out))
+    else:
+        output_file = sys.stdout
     
     # Always send progress messages to stderr so they don't interfere with stdout
     progress_stream = sys.stderr
@@ -375,14 +383,18 @@ def generate_delta(old_file, new_file, delta_out=None):
     print("="*60, file=sys.stderr)
 
 if __name__ == "__main__":
-    if len(sys.argv) < 3:
-        print("Usage: python sqldumpdiff.py <old_dump.sql> <new_dump.sql> [output.sql]")
-        print("       If output.sql is not provided, delta SQL is printed to stdout")
+    # Filter out any PyInstaller or system arguments that might interfere
+    # PyInstaller sometimes adds arguments, so we filter out anything starting with '-'
+    args = [arg for arg in sys.argv[1:] if not arg.startswith('-')]
+    
+    if len(args) < 2:
+        print("Usage: sqldumpdiff <old_dump.sql> <new_dump.sql> [output.sql]", file=sys.stderr)
+        print("       If output.sql is not provided, delta SQL is printed to stdout", file=sys.stderr)
         sys.exit(1)
-    elif len(sys.argv) == 3:
+    elif len(args) == 2:
         # No output file specified, print to stdout
-        generate_delta(sys.argv[1], sys.argv[2], None)
+        generate_delta(args[0], args[1], None)
     else:
         # Output file specified
-        generate_delta(sys.argv[1], sys.argv[2], sys.argv[3])
-        print(f"\nDelta script written to: {sys.argv[3]}", file=sys.stderr)
+        generate_delta(args[0], args[1], args[2])
+        print(f"\nDelta script written to: {args[2]}", file=sys.stderr)
