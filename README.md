@@ -6,6 +6,7 @@ A Python tool to compare two SQL dump files and generate a delta SQL script cont
 
 - 🔍 **Schema-aware comparison**: Automatically detects PRIMARY KEY constraints to identify records
 - 📊 **Progress tracking**: Visual progress bars for large dump files using `tqdm`
+- 📈 **Summary statistics**: Displays counts of inserts, updates, and deletes at the end
 - 🔄 **Multi-line support**: Handles multi-line CREATE TABLE and INSERT statements
 - 🎯 **Composite keys**: Supports tables with composite primary keys
 - 📝 **Delta generation**: Produces a complete SQL script with:
@@ -13,6 +14,7 @@ A Python tool to compare two SQL dump files and generate a delta SQL script cont
   - UPDATE statements for modified records
   - DELETE statements for removed records
 - ⚡ **Efficient processing**: Indexes records by primary key for fast lookups
+- 🔌 **Flexible output**: Output to file or stdout for easy piping to other commands
 
 ## Installation
 
@@ -40,19 +42,50 @@ This project uses [uv](https://github.com/astral-sh/uv) for dependency managemen
 
 ### Basic Usage
 
+The script accepts two required arguments and an optional third argument:
+
 ```bash
-python sqldumpdiff.py <old_dump.sql> <new_dump.sql>
+python sqldumpdiff.py <old_dump.sql> <new_dump.sql> [output.sql]
 ```
 
-This will generate a file named `full_delta_update.sql` containing the delta script.
+- **If `output.sql` is provided**: The delta script is written to that file
+- **If `output.sql` is omitted**: The delta script is printed to stdout (useful for piping)
 
-### Example
+**Note**: Progress messages and summary statistics are always printed to stderr, so they won't interfere with stdout output when piping.
+
+### Examples
+
+#### Write to a file
+
+```bash
+python sqldumpdiff.py database_old.sql database_new.sql delta.sql
+```
+
+This creates `delta.sql` with the delta script.
+
+#### Print to stdout
 
 ```bash
 python sqldumpdiff.py database_old.sql database_new.sql
 ```
 
-The output file `full_delta_update.sql` will contain:
+The delta SQL is printed to stdout. Progress messages appear on stderr.
+
+#### Pipe to MySQL
+
+```bash
+python sqldumpdiff.py database_old.sql database_new.sql | mysql mydatabase
+```
+
+#### Pipe to a file
+
+```bash
+python sqldumpdiff.py database_old.sql database_new.sql > delta.sql
+```
+
+### Output Example
+
+The generated delta script will contain:
 
 ```sql
 -- Full Delta Update Script
@@ -69,6 +102,21 @@ UPDATE `users` SET `email`='new@example.com' WHERE `id`='1';
 DELETE FROM `users` WHERE `id`='2';
 
 SET FOREIGN_KEY_CHECKS = 1;
+```
+
+### Summary Output
+
+After processing, the script displays a summary on stderr:
+
+```
+============================================================
+SUMMARY
+============================================================
+Inserts:  1,234
+Updates:  567
+Deletes: 89
+Total:    1,890
+============================================================
 ```
 
 ## How It Works
@@ -131,6 +179,10 @@ The executable will be created in the `dist/` directory.
 
 After building, you can use the executable directly:
 ```bash
+# Write to file
+./dist/sqldumpdiff <old_dump.sql> <new_dump.sql> output.sql
+
+# Print to stdout
 ./dist/sqldumpdiff <old_dump.sql> <new_dump.sql>
 ```
 
@@ -141,6 +193,10 @@ The executable is platform-specific (macOS, Linux, or Windows) and includes all 
 ### Running the Script
 
 ```bash
+# With output file
+uv run python sqldumpdiff.py <old_dump.sql> <new_dump.sql> <output.sql>
+
+# Print to stdout
 uv run python sqldumpdiff.py <old_dump.sql> <new_dump.sql>
 ```
 

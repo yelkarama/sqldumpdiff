@@ -215,33 +215,46 @@ def build_where_clause(pk_cols, data):
             where_parts.append(f"`{c}`='{safe_val}'")
     return " AND ".join(where_parts)
 
-def generate_delta(old_file, new_file, delta_out):
-    """Generates a delta SQL script comparing two SQL dump files."""
+def generate_delta(old_file, new_file, delta_out=None):
+    """Generates a delta SQL script comparing two SQL dump files.
+    
+    Args:
+        old_file: Path to the old SQL dump file
+        new_file: Path to the new SQL dump file
+        delta_out: Path to output file (None means write to stdout)
+    """
     # Validate input files exist
     if not os.path.exists(old_file):
         raise FileNotFoundError(f"Old file not found: {old_file}")
     if not os.path.exists(new_file):
         raise FileNotFoundError(f"New file not found: {new_file}")
     
-    print("Step 1: Mapping Schemas from DDL...")
+    # Determine output destination
+    output_to_stdout = delta_out is None
+    output_file = sys.stdout if output_to_stdout else delta_out
+    
+    # Always send progress messages to stderr so they don't interfere with stdout
+    progress_stream = sys.stderr
+    
+    print("Step 1: Mapping Schemas from DDL...", file=sys.stderr)
     try:
         pk_map = get_table_schemas(new_file, show_progress=True)
     except Exception as e:
         raise RuntimeError(f"Error parsing schema from {new_file}: {e}") from e
     
     if not pk_map:
-        print("Warning: No tables with PRIMARY KEY found in new file schema.")
+        print("Warning: No tables with PRIMARY KEY found in new file schema.", file=sys.stderr)
 
     # 2. Index Old Data
     old_records = {} 
-    print("Step 2: Indexing old records...")
+    print("Step 2: Indexing old records...", file=sys.stderr)
     try:
         # Count INSERT statements for progress tracking
         total_inserts = count_insert_statements(old_file)
         with open(old_file, 'r', encoding='utf-8') as f:
             insert_iter = parse_insert_statements(f)
             if total_inserts is not None:
-                insert_iter = tqdm(insert_iter, total=total_inserts, desc="Indexing old records", unit="inserts")
+                insert_iter = tqdm(insert_iter, total=total_inserts, desc="Indexing old records", unit="inserts", file=progress_stream)
             
             for insert_stmt in insert_iter:
                 table, cols, data, _ = get_row_data(insert_stmt)
@@ -264,20 +277,27 @@ def generate_delta(old_file, new_file, delta_out):
     delete_count = 0
 
     # 3. Compare for Inserts and Updates
-    print("Step 3: Comparing for Updates and Inserts...")
+    print("Step 3: Comparing for Updates and Inserts...", file=sys.stderr)
     try:
         # Count INSERT statements for progress tracking
         total_inserts = count_insert_statements(new_file)
         
-        with open(new_file, 'r', encoding='utf-8') as f_new, \
-             open(delta_out, 'w', encoding='utf-8') as f_out:
+        # Open output file or use stdout
+        if output_to_stdout:
+            f_new = open(new_file, 'r', encoding='utf-8')
+            f_out = sys.stdout
+        else:
+            f_new = open(new_file, 'r', encoding='utf-8')
+            f_out = open(output_file, 'w', encoding='utf-8')
+        
+        try:
             
             f_out.write("-- Full Delta Update Script\n")
             f_out.write("SET FOREIGN_KEY_CHECKS = 0;\n\n")
 
             insert_iter = parse_insert_statements(f_new)
             if total_inserts is not None:
-                insert_iter = tqdm(insert_iter, total=total_inserts, desc="Comparing records", unit="inserts")
+                insert_iter = tqdm(insert_iter, total=total_inserts, desc="Comparing records", unit="inserts", file=progress_stream)
             
             for insert_stmt in insert_iter:
                 table, cols, new_data, original_stmt = get_row_data(insert_stmt)
@@ -318,14 +338,14 @@ def generate_delta(old_file, new_file, delta_out):
                         update_count += 1
 
             # 4. Handle Deletions
-            print("Step 4: Identifying Deletions...")
+            print("Step 4: Identifying Deletions...", file=sys.stderr)
             f_out.write("-- DELETIONS\n")
             
             # Filter deletions first to get accurate count
             deletions = [(key, old_data) for key, old_data in old_records.items() 
                         if key not in matched_old_keys]
             
-            for key, old_data in tqdm(deletions, desc="Writing deletions", unit="records", disable=len(deletions) == 0):
+            for key, old_data in tqdm(deletions, desc="Writing deletions", unit="records", disable=len(deletions) == 0, file=progress_stream):
                 table, pk_values = key
                 # Skip if table no longer exists in new schema
                 if table not in pk_map:
@@ -337,22 +357,32 @@ def generate_delta(old_file, new_file, delta_out):
                 delete_count += 1
 
             f_out.write("SET FOREIGN_KEY_CHECKS = 1;\n")
+        finally:
+            f_new.close()
+            if not output_to_stdout:
+                f_out.close()
     except Exception as e:
         raise RuntimeError(f"Error processing new file or writing output: {e}") from e
     
-    # Print summary
-    print("\n" + "="*60)
-    print("SUMMARY")
-    print("="*60)
-    print(f"Inserts:  {insert_count:,}")
-    print(f"Updates:  {update_count:,}")
-    print(f"Deletes: {delete_count:,}")
-    print(f"Total:    {insert_count + update_count + delete_count:,}")
-    print("="*60)
+    # Print summary to stderr (so it doesn't interfere with stdout output)
+    print("\n" + "="*60, file=sys.stderr)
+    print("SUMMARY", file=sys.stderr)
+    print("="*60, file=sys.stderr)
+    print(f"Inserts:  {insert_count:,}", file=sys.stderr)
+    print(f"Updates:  {update_count:,}", file=sys.stderr)
+    print(f"Deletes: {delete_count:,}", file=sys.stderr)
+    print(f"Total:    {insert_count + update_count + delete_count:,}", file=sys.stderr)
+    print("="*60, file=sys.stderr)
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
-        print("Usage: python sqldiff.py <old_dump.sql> <new_dump.sql>")
+        print("Usage: python sqldumpdiff.py <old_dump.sql> <new_dump.sql> [output.sql]")
+        print("       If output.sql is not provided, delta SQL is printed to stdout")
+        sys.exit(1)
+    elif len(sys.argv) == 3:
+        # No output file specified, print to stdout
+        generate_delta(sys.argv[1], sys.argv[2], None)
     else:
-        generate_delta(sys.argv[1], sys.argv[2], "full_delta_update.sql")
-        print(f"\nDelta script written to: full_delta_update.sql")
+        # Output file specified
+        generate_delta(sys.argv[1], sys.argv[2], sys.argv[3])
+        print(f"\nDelta script written to: {sys.argv[3]}", file=sys.stderr)
