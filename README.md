@@ -102,6 +102,40 @@ The generated delta script:
 - For UPDATEs, includes comments showing the old values
 - Re-enables foreign key checks at the end
 
+## Building a Native Executable
+
+You can create a standalone executable that doesn't require Python to be installed.
+
+### Prerequisites
+
+Install build dependencies:
+```bash
+uv sync --extra dev
+```
+
+### Building
+
+Use the provided build script:
+```bash
+./build.sh
+```
+
+Or build manually with PyInstaller:
+```bash
+uv run pyinstaller --onefile --name sqldumpdiff sqldumpdiff.py
+```
+
+The executable will be created in the `dist/` directory.
+
+### Using the Executable
+
+After building, you can use the executable directly:
+```bash
+./dist/sqldumpdiff <old_dump.sql> <new_dump.sql>
+```
+
+The executable is platform-specific (macOS, Linux, or Windows) and includes all dependencies, so it can be distributed without requiring Python or any packages to be installed.
+
 ## Development
 
 ### Running the Script
@@ -115,7 +149,9 @@ uv run python sqldumpdiff.py <old_dump.sql> <new_dump.sql>
 ```
 sqldumpdiff/
 ├── sqldumpdiff.py    # Main script
-├── pyproject.toml     # Project configuration
+├── pyproject.toml    # Project configuration
+├── build.sh          # Build script for executable
+├── sqldumpdiff.spec  # PyInstaller spec file
 ├── uv.lock           # Dependency lock file
 └── README.md         # This file
 ```
