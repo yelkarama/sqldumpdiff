@@ -8,6 +8,8 @@ A Python tool to compare two SQL dump files and generate a delta SQL script cont
 - 📊 **Progress tracking**: Visual progress bars for large dump files using `tqdm`
 - 📈 **Summary statistics**: Displays counts of inserts, updates, and deletes at the end
 - 🔄 **Multi-line support**: Handles multi-line CREATE TABLE and INSERT statements
+- 📦 **Multi-row INSERT support**: Handles default mysqldump multi-value INSERTs and INSERTs without explicit column lists
+- 🧵 **Parallel per-table diffing**: Splits dumps by table and optionally processes tables in parallel
 - 🎯 **Composite keys**: Supports tables with composite primary keys
 - 📝 **Delta generation**: Produces a complete SQL script with:
   - INSERT statements for new records
@@ -28,6 +30,7 @@ This project uses [uv](https://github.com/astral-sh/uv) for dependency managemen
 ### Setup
 
 1. Clone the repository:
+
    ```bash
    git clone <repository-url>
    cd sqldumpdiff
@@ -45,7 +48,7 @@ This project uses [uv](https://github.com/astral-sh/uv) for dependency managemen
 The script accepts two required arguments and an optional third argument:
 
 ```bash
-python sqldumpdiff.py <old_dump.sql> <new_dump.sql> [output.sql]
+uv run sqldumpdiff.py <old_dump.sql> <new_dump.sql> [output.sql]
 ```
 
 - **If `output.sql` is provided**: The delta script is written to that file
@@ -58,7 +61,7 @@ python sqldumpdiff.py <old_dump.sql> <new_dump.sql> [output.sql]
 #### Write to a file
 
 ```bash
-python sqldumpdiff.py database_old.sql database_new.sql delta.sql
+uv run sqldumpdiff.py database_old.sql database_new.sql delta.sql
 ```
 
 This creates `delta.sql` with the delta script.
@@ -66,7 +69,7 @@ This creates `delta.sql` with the delta script.
 #### Print to stdout
 
 ```bash
-python sqldumpdiff.py database_old.sql database_new.sql
+uv run sqldumpdiff.py database_old.sql database_new.sql
 ```
 
 The delta SQL is printed to stdout. Progress messages appear on stderr.
@@ -74,13 +77,13 @@ The delta SQL is printed to stdout. Progress messages appear on stderr.
 #### Pipe to MySQL
 
 ```bash
-python sqldumpdiff.py database_old.sql database_new.sql | mysql mydatabase
+uv run sqldumpdiff.py database_old.sql database_new.sql | mysql mydatabase
 ```
 
 #### Pipe to a file
 
 ```bash
-python sqldumpdiff.py database_old.sql database_new.sql > delta.sql
+uv run sqldumpdiff.py database_old.sql database_new.sql > delta.sql
 ```
 
 ### Output Example
@@ -123,9 +126,9 @@ Total:    1,890
 
 The tool performs the following steps:
 
-1. **Schema Parsing**: Extracts PRIMARY KEY definitions from CREATE TABLE statements in the new dump file
-2. **Indexing**: Builds an index of all records from the old dump file, keyed by table name and primary key values
-3. **Comparison**: Compares records from the new dump against the indexed old records:
+1. **Schema Parsing**: Extracts PRIMARY KEY definitions and column order from CREATE TABLE statements
+2. **Per-table splitting**: Streams INSERT statements and writes per-table row files (handles multi-row VALUES)
+3. **Comparison (parallel-capable)**: For each table, compares new rows vs old by primary key
    - Records not found in the old dump → INSERT statements
    - Records with changed values → UPDATE statements
    - Records matched are tracked to identify deletions
@@ -138,13 +141,75 @@ The tool performs the following steps:
 
 ## Limitations
 
-- Currently only supports single-row INSERT statements. Multi-row INSERTs (e.g., `INSERT INTO ... VALUES (...), (...), (...)`) are skipped
 - Tables without PRIMARY KEY constraints are skipped (records cannot be uniquely identified)
 - Requires both dump files to be valid SQL with proper encoding (UTF-8)
+
+## Performance
+
+### Optimization Strategies
+
+The tool uses multiple strategies to handle large SQL dumps efficiently:
+
+1. **Streaming approach**: Processes data incrementally to handle files larger than available memory
+
+2. **Parallel processing**:
+   - INSERT statement parsing can be parallelized during the split phase using process-based parallelism to bypass Python's GIL
+   - Table comparison runs in parallel with configurable workers
+   - Both old and new files are split concurrently
+
+### Environment Variables
+
+Parallelism is enabled by default when more than one table exists. Fine-tune performance with these environment variables:
+
+#### Table Comparison
+
+- `SQLDUMPDIFF_PARALLEL=0` - Disable parallel processing entirely
+- `SQLDUMPDIFF_WORKERS=<n>` - Set worker count for table comparison (default: CPU cores)
+- `SQLDUMPDIFF_WORKERS=-1` - Use as many workers as there are tables (subject to hard cap)
+- `SQLDUMPDIFF_MAX_WORKERS=<n>` - Hard cap on workers (default: 4x CPU cores)
+- `SQLDUMPDIFF_EXECUTOR=thread` - Use threads instead of processes for table comparison (default: process)
+
+#### INSERT Parsing Optimization
+
+- `SQLDUMPDIFF_PARALLEL_INSERTS=1` - Enable parallel INSERT processing during splitting (recommended for large files)
+- `SQLDUMPDIFF_INSERT_WORKERS=<n>` - Worker count for INSERT parsing (default: CPU cores)
+- `SQLDUMPDIFF_INSERT_EXECUTOR=thread` - Use threads instead of processes (default: process)
+
+### Performance Tips
+
+For best performance with large dumps:
+
+```bash
+# Recommended settings for large files
+SQLDUMPDIFF_PARALLEL_INSERTS=1 \
+SQLDUMPDIFF_EXECUTOR=thread \
+SQLDUMPDIFF_WORKERS=-1 \
+uv run sqldumpdiff.py old.sql new.sql > delta.sql
+```
+
+**Note**: Multi-row INSERTs are expanded per row during splitting to avoid redundant parsing during comparison.
+
+## Benchmarking
+
+To find the optimal worker settings for your system, use the provided benchmark script:
+
+```bash
+./benchmark.sh 11.sql 22.sql
+```
+
+The script will test various configurations and save results with timing information. Common findings:
+
+- **Process-based parallelism** (`INSERT_EXECUTOR=process`) performs better than threads for CPU-intensive INSERT parsing
+- **Parallel INSERT processing** (`PARALLEL_INSERTS=1`) significantly speeds up large files (3-4x improvement)
+- **Worker count**: Start with CPU cores, experiment with 2x CPU cores for I/O bound workloads
+- **Table comparison**: Thread-based (`EXECUTOR=thread`) often performs better than processes when you have many small tables
+
+Review `benchmark_results_*.txt` to identify the fastest configuration for your data.
 
 ## Output Format
 
 The generated delta script:
+
 - Disables foreign key checks at the start
 - Includes comments indicating the type of change (NEW RECORD, UPDATE, DELETION)
 - For UPDATEs, includes comments showing the old values
@@ -157,6 +222,7 @@ You can create a standalone executable that doesn't require Python to be install
 ### Prerequisites
 
 Install build dependencies:
+
 ```bash
 uv sync --extra dev
 ```
@@ -164,11 +230,13 @@ uv sync --extra dev
 ### Building
 
 Use the provided build script:
+
 ```bash
 ./build.sh
 ```
 
 Or build manually with PyInstaller:
+
 ```bash
 uv run pyinstaller --onefile --name sqldumpdiff sqldumpdiff.py
 ```
@@ -178,6 +246,7 @@ The executable will be created in the `dist/` directory.
 ### Using the Executable
 
 After building, you can use the executable directly:
+
 ```bash
 # Write to file
 ./dist/sqldumpdiff <old_dump.sql> <new_dump.sql> output.sql
@@ -219,4 +288,3 @@ sqldumpdiff/
 ## Contributing
 
 [Add contribution guidelines here]
-

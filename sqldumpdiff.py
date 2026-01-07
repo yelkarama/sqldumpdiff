@@ -3,6 +3,11 @@ import sys
 import io
 import csv
 import os
+import json
+import tempfile
+import subprocess
+import shutil
+import concurrent.futures
 from tqdm import tqdm
 
 # Increase CSV field size limit to handle large TEXT/BLOB fields
@@ -19,10 +24,22 @@ except (OverflowError, ValueError):
 
 # Regex Patterns
 # Note: Both CREATE TABLE and INSERT statements now support multi-line parsing.
-# Note: INSERT_RE only matches single-row INSERTs. Multi-row INSERTs (VALUES (...), (...))
-# are not currently supported and will be skipped.
 TABLE_NAME_RE = re.compile(r"CREATE TABLE `(.+?)`", re.IGNORECASE)
+# Simplified INSERT patterns that don't try to capture huge VALUES parts (avoids backtracking)
+INSERT_START_RE = re.compile(r"^\s*INSERT\s+INTO\s+`([^`]+)`", re.IGNORECASE)
+COLUMNS_LIST_RE = re.compile(r"^\s*INSERT\s+INTO\s+`[^`]+`\s*\((.+?)\)\s*VALUES\s*", re.IGNORECASE | re.DOTALL)
+
+# Legacy single-row matcher retained for compatibility with helpers
 INSERT_RE = re.compile(r"INSERT INTO `(.+?)` \((.+?)\) VALUES \((.+?)\);", re.IGNORECASE)
+
+def count_create_tables(filepath):
+    """Counts CREATE TABLE statements in a SQL dump file."""
+    count = 0
+    with open(filepath, 'r', encoding='utf-8') as f:
+        for line in f:
+            if re.match(r'^CREATE TABLE', line, re.IGNORECASE):
+                count += 1
+    return count
 
 def count_insert_statements(filepath):
     """Counts the total number of INSERT statements in a file for progress tracking."""
@@ -46,7 +63,10 @@ def count_file_lines(filepath):
 
 def get_table_schemas(filepath, show_progress=False):
     """Parses the SQL file to find Primary Keys (including composite).
-    Handles multi-line CREATE TABLE statements."""
+    Handles multi-line CREATE TABLE statements.
+
+    Returns a dict mapping table_name -> list of primary key columns.
+    """
     schema_map = {}
     current_table = None
     table_content = []
@@ -87,6 +107,44 @@ def get_table_schemas(filepath, show_progress=False):
     
     return schema_map
 
+def get_table_columns(filepath, show_progress=False):
+    """Parses the SQL file to extract column order for each table from CREATE TABLE.
+    Returns a dict mapping table_name -> list of columns in order.
+    """
+    columns_map = {}
+    current_table = None
+    table_content = []
+    in_create_table = False
+
+    total_lines = count_file_lines(filepath) if show_progress else None
+
+    with open(filepath, 'r', encoding='utf-8') as f:
+        file_iter = tqdm(f, total=total_lines, desc="Parsing columns", unit="lines", disable=not show_progress) if show_progress else f
+
+        for line in file_iter:
+            table_match = TABLE_NAME_RE.search(line)
+            if table_match:
+                if in_create_table and current_table:
+                    columns_map[current_table] = _extract_columns_from_definition(''.join(table_content))
+                current_table = table_match.group(1)
+                table_content = [line]
+                in_create_table = True
+                continue
+
+            if in_create_table:
+                table_content.append(line)
+                if line.strip().endswith(';'):
+                    if current_table:
+                        columns_map[current_table] = _extract_columns_from_definition(''.join(table_content))
+                    current_table = None
+                    table_content = []
+                    in_create_table = False
+
+        if in_create_table and current_table:
+            columns_map[current_table] = _extract_columns_from_definition(''.join(table_content))
+
+    return columns_map
+
 def _process_table_definition(table_name, content, schema_map):
     """Extracts PRIMARY KEY from a CREATE TABLE statement (may be multi-line)."""
     # Use DOTALL flag to allow . to match newlines
@@ -99,6 +157,110 @@ def _process_table_definition(table_name, content, schema_map):
         # Extract column names
         cols = [c.strip(' `') for c in pk_def.split(',')]
         schema_map[table_name] = cols
+
+def _extract_columns_from_definition(content):
+    """Extracts column names (in order) from a CREATE TABLE statement.
+    Skips indexes and constraints.
+    """
+    # Isolate the portion inside the first matching parentheses after CREATE TABLE
+    # This is a simple parser tracking parentheses and quotes
+    in_single_quote = False
+    in_double_quote = False
+    escape_next = False
+    paren_depth = 0
+    capture = []
+    started = False
+    for ch in content:
+        if escape_next:
+            escape_next = False
+            if started:
+                capture.append(ch)
+            continue
+        if ch == '\\':
+            escape_next = True
+            if started:
+                capture.append(ch)
+            continue
+        if ch == "'" and not in_double_quote:
+            in_single_quote = not in_single_quote
+            if started:
+                capture.append(ch)
+            continue
+        if ch == '"' and not in_single_quote:
+            in_double_quote = not in_double_quote
+            if started:
+                capture.append(ch)
+            continue
+        if not in_single_quote and not in_double_quote:
+            if ch == '(':
+                paren_depth += 1
+                if not started:
+                    started = True
+                else:
+                    capture.append(ch)
+                continue
+            if ch == ')':
+                paren_depth -= 1
+                if paren_depth == 0:
+                    break
+                else:
+                    capture.append(ch)
+                continue
+        if started:
+            capture.append(ch)
+
+    inner = ''.join(capture)
+    # Split into top-level items by commas
+    items = []
+    buf = []
+    in_single_quote = False
+    in_double_quote = False
+    escape_next = False
+    paren_depth = 0
+    for ch in inner:
+        if escape_next:
+            buf.append(ch)
+            escape_next = False
+            continue
+        if ch == '\\':
+            buf.append(ch)
+            escape_next = True
+            continue
+        if ch == "'" and not in_double_quote:
+            buf.append(ch)
+            in_single_quote = not in_single_quote
+            continue
+        if ch == '"' and not in_single_quote:
+            buf.append(ch)
+            in_double_quote = not in_double_quote
+            continue
+        if not in_single_quote and not in_double_quote:
+            if ch == '(':
+                paren_depth += 1
+                buf.append(ch)
+                continue
+            if ch == ')':
+                paren_depth -= 1
+                buf.append(ch)
+                continue
+            if ch == ',' and paren_depth == 0:
+                items.append(''.join(buf).strip())
+                buf = []
+                continue
+        buf.append(ch)
+    if buf:
+        items.append(''.join(buf).strip())
+
+    columns = []
+    for item in items:
+        # Skip constraints
+        if re.match(r'^(PRIMARY\s+KEY|UNIQUE\s+KEY|KEY|CONSTRAINT|FOREIGN\s+KEY)\b', item, re.IGNORECASE):
+            continue
+        # Extract the column name between backticks at the start
+        m = re.match(r'^`([^`]+)`\s+', item)
+        if m:
+            columns.append(m.group(1))
+    return columns
 
 def parse_sql_values(values_str):
     """Handles CSV-style parsing of SQL values, respecting quotes and escapes."""
@@ -190,22 +352,325 @@ def parse_insert_statements(file_handle):
     if in_insert and current_insert:
         yield current_insert
 
-def get_row_data(insert_statement):
-    """Extracts table name, columns, and a data dictionary from an INSERT statement.
-    Now accepts a complete INSERT statement (may be multi-line).
-    Returns: (table, columns, data_dict, original_stmt) or (None, None, None, None) on error."""
-    # Normalize whitespace for regex matching (but preserve the original for output)
+def _split_value_groups(values_part):
+    """Splits the VALUES part "(row1),(row2),..." into a list of group strings including parentheses.
+    Respects quotes, escapes, and inner parentheses (e.g., functions).
+    """
+    groups = []
+    buf = []
+    in_single_quote = False
+    in_double_quote = False
+    escape_next = False
+    paren_depth = 0
+    # Trim trailing semicolon if present
+    values_part = values_part.strip()
+    if values_part.endswith(';'):
+        values_part = values_part[:-1]
+    for ch in values_part:
+        if escape_next:
+            buf.append(ch)
+            escape_next = False
+            continue
+        if ch == '\\':
+            buf.append(ch)
+            escape_next = True
+            continue
+        if ch == "'" and not in_double_quote:
+            buf.append(ch)
+            in_single_quote = not in_single_quote
+            continue
+        if ch == '"' and not in_single_quote:
+            buf.append(ch)
+            in_double_quote = not in_double_quote
+            continue
+        if not in_single_quote and not in_double_quote:
+            if ch == '(':
+                paren_depth += 1
+                buf.append(ch)
+                continue
+            if ch == ')':
+                paren_depth -= 1
+                buf.append(ch)
+                if paren_depth == 0:
+                    # End of a group
+                    groups.append(''.join(buf).strip())
+                    buf = []
+                continue
+            if ch == ',' and paren_depth == 0:
+                # Separator between groups; ignore
+                continue
+        buf.append(ch)
+    # In case of trailing content (shouldn't for valid SQL)
+    if buf:
+        leftover = ''.join(buf).strip()
+        if leftover:
+            groups.append(leftover)
+    return groups
+
+def expand_insert_statement(insert_statement, columns_map_for_file):
+    """Expands a potentially multi-row INSERT statement into per-row entries.
+    Returns a list of tuples: (table, columns, data_dict, single_row_stmt)
+
+    columns_map_for_file is used when the INSERT lacks an explicit column list (mysqldump default).
+    """
+    # Normalize whitespace for parsing (but keep original line breaks to avoid huge single lines)
     normalized = ' '.join(insert_statement.split())
-    match = INSERT_RE.search(normalized)
-    if not match: 
-        return None, None, None, None
-    table = match.group(1)
-    columns = [c.strip(' `') for c in match.group(2).split(',')]
-    values = parse_sql_values(match.group(3))
-    # Safety check: ensure columns and values match in count
-    if len(columns) != len(values):
-        return None, None, None, None
-    return table, columns, dict(zip(columns, values)), insert_statement
+    
+    # Extract table name
+    m_table = INSERT_START_RE.search(normalized)
+    if not m_table:
+        return []
+    table = m_table.group(1)
+    
+    # Try to extract columns list
+    columns = None
+    values_start_pos = 0
+    m_cols = COLUMNS_LIST_RE.search(normalized)
+    if m_cols:
+        columns = [c.strip(' `') for c in m_cols.group(1).split(',')]
+        values_start_pos = m_cols.end()
+    else:
+        # No explicit columns, use schema
+        columns = columns_map_for_file.get(table)
+        # Find VALUES keyword
+        values_idx = normalized.upper().find('VALUES')
+        if values_idx == -1:
+            return []
+        values_start_pos = values_idx + 6  # len('VALUES')
+    
+    if not columns:
+        return []
+    
+    # Extract values part (everything from VALUES to the semicolon)
+    values_part = normalized[values_start_pos:].strip()
+    if values_part.endswith(';'):
+        values_part = values_part[:-1]
+    
+    if not values_part:
+        return []
+
+    groups = _split_value_groups(values_part)
+    results = []
+    # Determine if original had explicit columns by checking if COLUMNS_LIST_RE matched
+    has_explicit_cols = m_cols is not None
+    
+    for grp in groups:
+        inner = grp.strip()
+        # Remove outer parentheses
+        if inner.startswith('(') and inner.endswith(')'):
+            inner = inner[1:-1]
+        values = parse_sql_values(inner)
+        if len(values) != len(columns):
+            # Skip malformed row
+            continue
+        data = dict(zip(columns, values))
+        # Build a single-row INSERT statement mirroring the original style
+        if has_explicit_cols:
+            # Preserve column list
+            single_stmt = f"INSERT INTO `{table}` ({', '.join(f'`{c}`' for c in columns)}) VALUES {grp};"
+        else:
+            single_stmt = f"INSERT INTO `{table}` VALUES {grp};"
+        results.append((table, columns, data, single_stmt))
+    return results
+
+
+def _load_table_file(path):
+    """Loads JSONL rows for a single table. Each line structure: {columns, data, stmt}."""
+    entries = []
+    if not path or not os.path.exists(path):
+        return entries
+    with open(path, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            entries.append(json.loads(line))
+    return entries
+
+
+def _process_table(args):
+    """Worker to compute delta for a single table. Designed to be picklable for multiprocessing."""
+    table, pk_cols, old_path, new_path = args
+
+    old_records = {}
+    # Load old rows
+    for entry in _load_table_file(old_path):
+        data = entry.get('data', {})
+        pk_values = tuple(data.get(c) for c in pk_cols)
+        old_records[pk_values] = entry
+
+    changes_lines = []
+    deletion_lines = []
+    matched_old = set()
+    insert_count = 0
+    update_count = 0
+    delete_count = 0
+
+    # Process new rows
+    for entry in _load_table_file(new_path):
+        data = entry.get('data', {})
+        cols = entry.get('columns', [])
+        stmt = entry.get('stmt', '')
+        pk_values = tuple(data.get(c) for c in pk_cols)
+        old_entry = old_records.get(pk_values)
+
+        if not old_entry:
+            changes_lines.append(f"-- NEW RECORD IN {table}\n{stmt}\n")
+            insert_count += 1
+            continue
+
+        matched_old.add(pk_values)
+        updates = []
+        comments = []
+        old_data = old_entry.get('data', {})
+        for col in cols:
+            ov, nv = old_data.get(col), data.get(col)
+            ov_norm, nv_norm = normalize_null(ov), normalize_null(nv)
+            if ov_norm != nv_norm:
+                comments.append(f"-- {col} old value: {ov}")
+                if nv_norm is None:
+                    updates.append(f"`{col}`=NULL")
+                else:
+                    safe_nv = str(nv).replace("'", "''")
+                    updates.append(f"`{col}`='{safe_nv}'")
+
+        if updates:
+            where_str = build_where_clause(pk_cols, data)
+            if comments:
+                changes_lines.extend(c + "\n" for c in comments)
+            changes_lines.append(f"UPDATE `{table}` SET {', '.join(updates)} WHERE {where_str};\n\n")
+            update_count += 1
+
+    # Handle deletions
+    for pk_values, old_entry in old_records.items():
+        if pk_values in matched_old:
+            continue
+        old_data = old_entry.get('data', {})
+        where_str = build_where_clause(pk_cols, old_data)
+        deletion_lines.append(f"-- DELETED FROM {table}: {pk_values}\n")
+        deletion_lines.append(f"DELETE FROM `{table}` WHERE {where_str};\n\n")
+        delete_count += 1
+
+    return {
+        'table': table,
+        'changes': ''.join(changes_lines),
+        'deletions': ''.join(deletion_lines),
+        'insert_count': insert_count,
+        'update_count': update_count,
+        'delete_count': delete_count,
+    }
+
+
+def _sanitize_filename(name):
+    """Sanitize table name for use in filename."""
+    return re.sub(r'[^A-Za-z0-9_.-]+', '_', name)
+
+
+def _process_insert_for_split(args):
+    """Module-level function for parallel INSERT processing (picklable for multiprocessing)."""
+    insert_stmt, cols_map = args
+    return expand_insert_statement(insert_stmt, cols_map)
+
+
+def split_dump_by_table(dump_file, columns_map, pk_map, tmpdir, label, show_progress=False):
+    """Split a dump into per-table JSONL files for parallel processing.
+    Returns a dict: table_name -> jsonl path.
+    """
+    table_files = {}
+    file_handles = {}
+    
+    # Check if parallel INSERT processing is enabled
+    parallel_inserts_env = os.getenv("SQLDUMPDIFF_PARALLEL_INSERTS", "0")
+    parallel_inserts = parallel_inserts_env.lower() in ("1", "true", "yes")
+    
+    if parallel_inserts:
+        # Parallel mode: collect all INSERT statements first, then process in parallel
+        insert_statements = []
+        with open(dump_file, 'r', encoding='utf-8') as f:
+            for insert_stmt in parse_insert_statements(f):
+                insert_statements.append(insert_stmt)
+        
+        if show_progress:
+            print(f"Collected {len(insert_statements)} INSERT statements from {label}, processing in parallel...", file=sys.stderr)
+        
+        # Determine worker count for INSERT processing
+        insert_workers_env = os.getenv("SQLDUMPDIFF_INSERT_WORKERS")
+        if insert_workers_env:
+            try:
+                insert_workers = int(insert_workers_env)
+                if insert_workers == -1:
+                    insert_workers = os.cpu_count() or 4
+            except ValueError:
+                insert_workers = os.cpu_count() or 4
+        else:
+            insert_workers = os.cpu_count() or 4
+        
+        # Use processes for CPU-bound INSERT parsing (avoids GIL)
+        executor_type = os.getenv("SQLDUMPDIFF_INSERT_EXECUTOR", "process").lower()
+        if executor_type == "thread":
+            executor_class = concurrent.futures.ThreadPoolExecutor
+        else:
+            executor_class = concurrent.futures.ProcessPoolExecutor
+        
+        with executor_class(max_workers=insert_workers) as executor:
+            # Prepare args for process-based executor (needs to pass columns_map)
+            args_list = [(stmt, columns_map) for stmt in insert_statements]
+            results_iter = executor.map(_process_insert_for_split, args_list)
+            if show_progress:
+                results_iter = tqdm(results_iter, total=len(insert_statements), desc=f"Splitting {label}", unit="inserts", file=sys.stderr)
+            
+            for rows in results_iter:
+                for table, cols, data, single_stmt in rows:
+                    if table not in pk_map:
+                        continue
+                    pk_cols = pk_map[table]
+                    if not all(c in data for c in pk_cols):
+                        continue
+
+                    if table not in table_files:
+                        path = os.path.join(tmpdir, f"{label}_{_sanitize_filename(table)}.jsonl")
+                        table_files[table] = path
+                        file_handles[table] = open(path, 'w', encoding='utf-8')
+
+                    line = json.dumps({
+                        'columns': cols,
+                        'data': data,
+                        'stmt': single_stmt,
+                    }, ensure_ascii=False)
+                    file_handles[table].write(line + "\n")
+    else:
+        # Serial mode (default): stream and process one at a time
+        with open(dump_file, 'r', encoding='utf-8') as f:
+            insert_iter = parse_insert_statements(f)
+            if show_progress:
+                insert_iter = tqdm(insert_iter, desc=f"Splitting {label}", unit="inserts", file=sys.stderr)
+
+            for insert_stmt in insert_iter:
+                rows = expand_insert_statement(insert_stmt, columns_map)
+                for table, cols, data, single_stmt in rows:
+                    if table not in pk_map:
+                        continue  # skip tables without PKs
+                    pk_cols = pk_map[table]
+                    if not all(c in data for c in pk_cols):
+                        continue
+
+                    if table not in table_files:
+                        path = os.path.join(tmpdir, f"{label}_{_sanitize_filename(table)}.jsonl")
+                        table_files[table] = path
+                        file_handles[table] = open(path, 'w', encoding='utf-8')
+
+                    line = json.dumps({
+                        'columns': cols,
+                        'data': data,
+                        'stmt': single_stmt,
+                    }, ensure_ascii=False)
+                    file_handles[table].write(line + "\n")
+
+    # Close handles
+    for h in file_handles.values():
+        h.close()
+
+    return table_files
 
 def normalize_null(val):
     """Normalizes None and 'NULL' string to None for consistent comparison."""
@@ -259,145 +724,150 @@ def generate_delta(old_file, new_file, delta_out=None):
     print("Step 1: Mapping Schemas from DDL...", file=sys.stderr)
     try:
         pk_map = get_table_schemas(new_file, show_progress=True)
+        # Column maps for parsing INSERTs without column lists
+        new_columns_map = get_table_columns(new_file, show_progress=False)
+        old_columns_map = get_table_columns(old_file, show_progress=False)
     except Exception as e:
-        raise RuntimeError(f"Error parsing schema from {new_file}: {e}") from e
+        raise RuntimeError(f"Error parsing schema: {e}") from e
     
     if not pk_map:
         print("Warning: No tables with PRIMARY KEY found in new file schema.", file=sys.stderr)
 
     # 2. Index Old Data
     old_records = {} 
-    print("Step 2: Indexing old records...", file=sys.stderr)
+    # 2. Split dumps by table and persist to temp files
+    print("Step 2: Splitting dumps by table (streaming with optional parallel INSERT processing)...", file=sys.stderr)
     try:
-        # Count INSERT statements for progress tracking
-        total_inserts = count_insert_statements(old_file)
-        with open(old_file, 'r', encoding='utf-8') as f:
-            insert_iter = parse_insert_statements(f)
-            # Always show progress bar, with or without total
-            if total_inserts is not None:
-                insert_iter = tqdm(insert_iter, total=total_inserts, desc="Indexing old records", unit="inserts", file=progress_stream)
+        with tempfile.TemporaryDirectory(prefix="sqldumpdiff_") as tmpdir:
+            # Split old and new files in parallel using threads (I/O bound)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as split_executor:
+                old_future = split_executor.submit(split_dump_by_table, old_file, old_columns_map, pk_map, tmpdir, "old", True)
+                new_future = split_executor.submit(split_dump_by_table, new_file, new_columns_map, pk_map, tmpdir, "new", True)
+                old_table_files = old_future.result()
+                new_table_files = new_future.result()
+
+            tables_to_process = sorted(set(old_table_files.keys()) | set(new_table_files.keys()))
+            if not tables_to_process:
+                print("No tables with primary keys found to process.", file=sys.stderr)
+                return
+
+            parallel_env = os.getenv("SQLDUMPDIFF_PARALLEL", "1")
+            parallel = parallel_env.lower() not in ("0", "false", "no") and len(tables_to_process) > 1
+
+            cpu_count = os.cpu_count() or 1
+            hard_cap_env = os.getenv("SQLDUMPDIFF_MAX_WORKERS")
+            # Default hard cap: 4x CPU cores
+            hard_cap_default = max(cpu_count * 4, cpu_count)
+            hard_cap = None
+            try:
+                hard_cap = int(hard_cap_env) if hard_cap_env else hard_cap_default
+            except ValueError:
+                hard_cap = hard_cap_default
+
+            max_workers_env = os.getenv("SQLDUMPDIFF_WORKERS")
+            max_workers = None
+            if max_workers_env:
+                try:
+                    max_workers_val = int(max_workers_env)
+                    if max_workers_val == -1:
+                        max_workers = len(tables_to_process)
+                    elif max_workers_val > 0:
+                        max_workers = max_workers_val
+                except ValueError:
+                    max_workers = None
+
+            # Defaults: if not specified, use CPU count
+            if max_workers is None:
+                max_workers = cpu_count
+
+            # Oversubscription is allowed by default, but capped
+            if parallel and hard_cap and max_workers > hard_cap:
+                print(
+                    f"SQLDUMPDIFF_WORKERS={max_workers} exceeds hard cap {hard_cap}; clamping to {hard_cap}. "
+                    "Override cap with SQLDUMPDIFF_MAX_WORKERS.",
+                    file=sys.stderr,
+                )
+                max_workers = hard_cap
+
+            worker_args = [
+                (table, pk_map[table], old_table_files.get(table), new_table_files.get(table))
+                for table in tables_to_process
+                if table in pk_map
+            ]
+
+            results = []
+            mode_desc = f" using {max_workers} workers" if parallel else " serially"
+            executor_type = os.getenv("SQLDUMPDIFF_EXECUTOR", "process").lower()
+            if parallel:
+                print(f"Step 3: Comparing {len(tables_to_process)} tables{mode_desc} ({executor_type})...", file=sys.stderr)
             else:
-                insert_iter = tqdm(insert_iter, desc="Indexing old records", unit="inserts", file=progress_stream)
-            
-            for insert_stmt in insert_iter:
-                table, cols, data, _ = get_row_data(insert_stmt)
-                if table and table in pk_map:
-                    pk_cols = pk_map[table]
-                    # Skip if any primary key column is missing from the data
-                    if not all(c in data for c in pk_cols):
-                        continue
-                    # Tuple used as dict key for composite key support
-                    pk_values = tuple(data.get(c) for c in pk_cols)
-                    old_records[(table, pk_values)] = data
-    except Exception as e:
-        raise RuntimeError(f"Error processing old file {old_file}: {e}") from e
+                print(f"Step 3: Comparing {len(tables_to_process)} tables{mode_desc}...", file=sys.stderr)
 
-    matched_old_keys = set()
-
-    # Initialize counters
-    insert_count = 0
-    update_count = 0
-    delete_count = 0
-
-    # 3. Compare for Inserts and Updates
-    print("Step 3: Comparing for Updates and Inserts...", file=sys.stderr)
-    try:
-        # Count INSERT statements for progress tracking
-        total_inserts = count_insert_statements(new_file)
-        
-        # Open output file or use stdout
-        if output_to_stdout:
-            f_new = open(new_file, 'r', encoding='utf-8')
-            f_out = sys.stdout
-        else:
-            f_new = open(new_file, 'r', encoding='utf-8')
-            f_out = open(output_file, 'w', encoding='utf-8')
-        
-        try:
-            
-            f_out.write("-- Full Delta Update Script\n")
-            f_out.write("SET FOREIGN_KEY_CHECKS = 0;\n\n")
-
-            insert_iter = parse_insert_statements(f_new)
-            # Always show progress bar, with or without total
-            if total_inserts is not None:
-                insert_iter = tqdm(insert_iter, total=total_inserts, desc="Comparing records", unit="inserts", file=progress_stream)
-            else:
-                insert_iter = tqdm(insert_iter, desc="Comparing records", unit="inserts", file=progress_stream)
-            
-            for insert_stmt in insert_iter:
-                table, cols, new_data, original_stmt = get_row_data(insert_stmt)
-                if not table or table not in pk_map:
-                    continue
-
-                pk_cols = pk_map[table]
-                # Skip if any primary key column is missing from the data
-                if not all(c in new_data for c in pk_cols):
-                    continue
-                pk_values = tuple(new_data.get(c) for c in pk_cols)
-                old_data = old_records.get((table, pk_values))
-
-                if not old_data:
-                    # This record is entirely new
-                    f_out.write(f"-- NEW RECORD IN {table}\n{original_stmt}\n")
-                    insert_count += 1
+            if parallel:
+                executor_type = os.getenv("SQLDUMPDIFF_EXECUTOR", "process").lower()
+                if executor_type == "thread":
+                    executor_class = concurrent.futures.ThreadPoolExecutor
                 else:
-                    matched_old_keys.add((table, pk_values))
-                    updates = []
-                    comments = []
-                    for col in cols:
-                        ov, nv = old_data.get(col), new_data.get(col)
-                        # Normalize NULL values for proper comparison
-                        ov_norm, nv_norm = normalize_null(ov), normalize_null(nv)
-                        if ov_norm != nv_norm:
-                            comments.append(f"-- {col} old value: {ov}")
-                            if nv_norm is None:
-                                updates.append(f"`{col}`=NULL")
-                            else:
-                                safe_nv = str(nv).replace("'", "''")
-                                updates.append(f"`{col}`='{safe_nv}'")
+                    executor_class = concurrent.futures.ProcessPoolExecutor
+                
+                with executor_class(max_workers=max_workers) as executor:
+                    future_to_table = {executor.submit(_process_table, arg): arg[0] for arg in worker_args}
+                    for future in tqdm(concurrent.futures.as_completed(future_to_table), total=len(future_to_table), desc="Processing tables", unit="table", file=progress_stream):
+                        try:
+                            results.append(future.result())
+                        except Exception as e:
+                            print(f"Error processing table {future_to_table[future]}: {e}", file=sys.stderr)
+            else:
+                for arg in tqdm(worker_args, desc="Processing tables", unit="table", file=progress_stream):
+                    results.append(_process_table(arg))
 
-                    if updates:
-                        where_str = build_where_clause(pk_cols, new_data)
-                        f_out.writelines(c + "\n" for c in comments)
-                        f_out.write(f"UPDATE `{table}` SET {', '.join(updates)} WHERE {where_str};\n\n")
-                        update_count += 1
+            # Open output file or use stdout
+            if output_to_stdout:
+                f_out = sys.stdout
+            else:
+                f_out = open(output_file, 'w', encoding='utf-8')
 
-            # 4. Handle Deletions
-            print("Step 4: Identifying Deletions...", file=sys.stderr)
-            f_out.write("-- DELETIONS\n")
-            
-            # Filter deletions first to get accurate count
-            deletions = [(key, old_data) for key, old_data in old_records.items() 
-                        if key not in matched_old_keys]
-            
-            for key, old_data in tqdm(deletions, desc="Writing deletions", unit="records", disable=len(deletions) == 0, file=progress_stream):
-                table, pk_values = key
-                # Skip if table no longer exists in new schema
-                if table not in pk_map:
-                    continue
-                pk_cols = pk_map[table]
-                where_str = build_where_clause(pk_cols, old_data)
-                f_out.write(f"-- DELETED FROM {table}: {pk_values}\n")
-                f_out.write(f"DELETE FROM `{table}` WHERE {where_str};\n\n")
-                delete_count += 1
+            try:
+                f_out.write("-- Full Delta Update Script\n")
+                f_out.write("SET FOREIGN_KEY_CHECKS = 0;\n\n")
 
-            f_out.write("SET FOREIGN_KEY_CHECKS = 1;\n")
-        finally:
-            f_new.close()
-            if not output_to_stdout:
-                f_out.close()
+                insert_count = 0
+                update_count = 0
+                delete_count = 0
+
+                # Write inserts/updates grouped by table (sorted for determinism)
+                for res in sorted(results, key=lambda r: r['table']):
+                    if res['changes']:
+                        f_out.write(f"-- TABLE {res['table']}\n")
+                        f_out.write(res['changes'])
+                    insert_count += res['insert_count']
+                    update_count += res['update_count']
+
+                # Deletions
+                print("Step 4: Identifying Deletions...", file=sys.stderr)
+                f_out.write("-- DELETIONS\n")
+                for res in sorted(results, key=lambda r: r['table']):
+                    if res['deletions']:
+                        f_out.write(f"-- TABLE {res['table']}\n")
+                        f_out.write(res['deletions'])
+                    delete_count += res['delete_count']
+
+                f_out.write("SET FOREIGN_KEY_CHECKS = 1;\n")
+            finally:
+                if not output_to_stdout:
+                    f_out.close()
     except Exception as e:
-        raise RuntimeError(f"Error processing new file or writing output: {e}") from e
-    
+        raise RuntimeError(f"Error during processing: {e}") from e
+
     # Print summary to stderr (so it doesn't interfere with stdout output)
+    total = insert_count + update_count + delete_count
     print("\n" + "="*60, file=sys.stderr)
     print("SUMMARY", file=sys.stderr)
     print("="*60, file=sys.stderr)
     print(f"Inserts:  {insert_count:,}", file=sys.stderr)
     print(f"Updates:  {update_count:,}", file=sys.stderr)
     print(f"Deletes: {delete_count:,}", file=sys.stderr)
-    print(f"Total:    {insert_count + update_count + delete_count:,}", file=sys.stderr)
+    print(f"Total:    {total:,}", file=sys.stderr)
     print("="*60, file=sys.stderr)
 
 if __name__ == "__main__":
