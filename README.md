@@ -206,6 +206,79 @@ The script will test various configurations and save results with timing informa
 
 Review `benchmark_results_*.txt` to identify the fastest configuration for your data.
 
+## Language Performance Considerations
+
+### Python's GIL Limitations
+
+Python's Global Interpreter Lock (GIL) limits true parallel CPU execution for threads. While process-based parallelism (as used in this tool) bypasses the GIL, it has overhead for inter-process communication and memory duplication.
+
+### Alternative Languages for Better Performance
+
+If you need significantly faster execution, consider these alternatives:
+
+#### 1. **Rust** (Recommended - Best Performance)
+
+- **Speed**: 5-10x faster than Python
+- **Pros**:
+  - True parallelism without GIL
+  - Zero-cost abstractions
+  - Memory safety without garbage collection
+  - Excellent for CPU-intensive parsing
+  - Single binary deployment
+- **Cons**: Steeper learning curve, longer development time
+- **Best for**: Maximum performance, production deployments at scale
+
+#### 2. **Go** (Recommended - Best Balance)
+
+- **Speed**: 3-5x faster than Python
+- **Pros**:
+  - Native concurrency with goroutines (cheap, lightweight)
+  - Simple syntax, easy to learn
+  - Fast compilation
+  - Single binary deployment
+  - Good standard library for parsing
+- **Cons**: Less control than Rust, garbage collection overhead
+- **Best for**: Fast development with good performance gains
+
+#### 3. **C++** (Maximum Speed)
+
+- **Speed**: 10-20x faster than Python (when optimized)
+- **Pros**:
+  - Absolute maximum performance
+  - Full control over memory and threading
+- **Cons**: Complex, manual memory management, longer development
+- **Best for**: When every millisecond counts
+
+#### 4. **Java/Kotlin** (Enterprise Option)
+
+- **Speed**: 2-4x faster than Python
+- **Pros**:
+  - Mature ecosystem
+  - Good JVM threading
+  - Great tooling
+- **Cons**: JVM startup overhead, heavier runtime
+- **Best for**: Enterprise environments with existing Java infrastructure
+
+### Realistic Performance Gains
+
+Current Python implementation with optimizations: **~5:43 for your dataset**
+
+Estimated rewrite times:
+
+- **Go**: ~2-3 minutes (50-60% faster)
+- **Rust**: ~1-2 minutes (70-80% faster)
+- **C++**: ~1 minute (80-90% faster, highly optimized)
+
+### Recommendation
+
+For most use cases, the current Python implementation with `PARALLEL_INSERTS=1` is sufficient. Consider a rewrite only if:
+
+- You run this tool very frequently (hundreds of times per day)
+- You need sub-minute execution for large dumps
+- You want to distribute a zero-dependency binary
+
+**Quick win**: The Go rewrite would be the best ROI (2-3 weeks development for 3-5x speedup).
+
 ## Output Format
 
 The generated delta script:
