@@ -30,3 +30,23 @@ Thumbs.db
 # Output files
 full_delta_update.sql
 
+*.sql
+*.log
+*.tmp
+*.bak
+*.diff
+*.patch
+*.out
+*.err
+*.rej
+*.orig
+*.sqlite
+*.db
+*.sqlite3
+*.tar.gz
+*.zip
+*.tar.bz2
+*.7z
+*.gz
+*.xz
+*.egg-info/
