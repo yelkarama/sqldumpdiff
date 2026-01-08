@@ -21,6 +21,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 
+import lombok.extern.java.Log;
 import me.tongfei.progressbar.ProgressBar;
 import me.tongfei.progressbar.ProgressBarBuilder;
 import me.tongfei.progressbar.ProgressBarStyle;
@@ -28,6 +29,7 @@ import me.tongfei.progressbar.ProgressBarStyle;
 /**
  * Main delta generation logic using virtual threads for maximum concurrency.
  */
+@Log
 public class DeltaGenerator {
 
     public void generateDelta(String oldFilePath, String newFilePath, String outputPath)
@@ -49,7 +51,7 @@ public class DeltaGenerator {
         Map<String, List<String>> pkMap;
         Map<String, List<String>> oldColumnsMap;
         Map<String, List<String>> newColumnsMap;
-        
+
         try (ProgressBar pb = new ProgressBarBuilder()
                 .setTaskName("Parsing schemas")
                 .setInitialMax(3)
@@ -75,100 +77,97 @@ public class DeltaGenerator {
             try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
                 long oldFileSize = Files.size(oldFile);
                 long newFileSize = Files.size(newFile);
-                
-                ProgressBar oldPb = new ProgressBarBuilder()
+
+                try (ProgressBar oldPb = new ProgressBarBuilder()
                         .setTaskName("Splitting old dump")
                         .setInitialMax(oldFileSize)
                         .setStyle(ProgressBarStyle.ASCII)
                         .setUnit(" bytes", 1)
                         .build();
-                        
-                ProgressBar newPb = new ProgressBarBuilder()
-                        .setTaskName("Splitting new dump")
-                        .setInitialMax(newFileSize)
-                        .setStyle(ProgressBarStyle.ASCII)
-                        .setUnit(" bytes", 1)
-                        .build();
-                
-                Future<Map<String, Path>> oldFuture = executor
-                        .submit(() -> splitDumpByTable(oldFile, oldColumnsMap, pkMap, tempDir, "old", oldPb));
-                Future<Map<String, Path>> newFuture = executor
-                        .submit(() -> splitDumpByTable(newFile, newColumnsMap, pkMap, tempDir, "new", newPb));
+                        ProgressBar newPb = new ProgressBarBuilder()
+                                .setTaskName("Splitting new dump")
+                                .setInitialMax(newFileSize)
+                                .setStyle(ProgressBarStyle.ASCII)
+                                .setUnit(" bytes", 1)
+                                .build()) {
 
-                Map<String, Path> oldTableFiles = oldFuture.get();
-                Map<String, Path> newTableFiles = newFuture.get();
-                
-                oldPb.close();
-                newPb.close();
+                    Future<Map<String, Path>> oldFuture = executor
+                            .submit(() -> splitDumpByTable(oldFile, oldColumnsMap, pkMap, tempDir, "old", oldPb));
+                    Future<Map<String, Path>> newFuture = executor
+                            .submit(() -> splitDumpByTable(newFile, newColumnsMap, pkMap, tempDir, "new", newPb));
 
-                Set<String> allTables = new HashSet<>();
-                allTables.addAll(oldTableFiles.keySet());
-                allTables.addAll(newTableFiles.keySet());
+                    Map<String, Path> oldTableFiles = oldFuture.get();
+                    Map<String, Path> newTableFiles = newFuture.get();
 
-                if (allTables.isEmpty()) {
-                    System.err.println("No tables with primary keys found to process.");
-                    return;
-                }
+                    Set<String> allTables = new HashSet<>();
+                    allTables.addAll(oldTableFiles.keySet());
+                    allTables.addAll(newTableFiles.keySet());
 
-                System.err.printf("Step 3: Comparing %d tables using virtual threads...\n", allTables.size());
+                    if (allTables.isEmpty()) {
+                        log.warning("No tables with primary keys found to process.");
+                        return;
+                    }
 
-                // Process all tables in parallel with virtual threads
-                List<TableComparison> comparisons = allTables.stream()
-                        .map(table -> new TableComparison(
-                                table,
-                                pkMap.get(table),
-                                oldTableFiles.get(table),
-                                newTableFiles.get(table)))
-                        .toList();
+                    log.info("Step 3: Comparing \" + allTables.size() + \" tables using virtual threads...");
 
-                List<ComparisonResult> results = new ArrayList<>();
-                try (ProgressBar pb = new ProgressBarBuilder()
-                        .setTaskName("Comparing tables")
-                        .setInitialMax(comparisons.size())
-                        .setStyle(ProgressBarStyle.ASCII)
-                        .build();
-                     ExecutorService compareExecutor = Executors.newVirtualThreadPerTaskExecutor()) {
-                    
-                    List<Future<ComparisonResult>> futures = comparisons.stream()
-                            .map(comp -> compareExecutor.submit(() -> {
-                                ComparisonResult result = compareTable(comp);
-                                pb.step();
-                                return result;
-                            }))
+                    // Process all tables in parallel with virtual threads
+                    List<TableComparison> comparisons = allTables.stream()
+                            .map(table -> new TableComparison(
+                                    table,
+                                    pkMap.get(table),
+                                    oldTableFiles.get(table),
+                                    newTableFiles.get(table)))
                             .toList();
 
-                    for (Future<ComparisonResult> future : futures) {
-                        results.add(future.get());
+                    List<ComparisonResult> results = new ArrayList<>();
+                    try (ProgressBar pb = new ProgressBarBuilder()
+                            .setTaskName("Comparing tables")
+                            .setInitialMax(comparisons.size())
+                            .setStyle(ProgressBarStyle.ASCII)
+                            .build();
+                            ExecutorService compareExecutor = Executors.newVirtualThreadPerTaskExecutor()) {
+
+                        List<Future<ComparisonResult>> futures = comparisons.stream()
+                                .map(comp -> compareExecutor.submit(() -> {
+                                    ComparisonResult result = compareTable(comp);
+                                    pb.step();
+                                    return result;
+                                }))
+                                .toList();
+
+                        for (Future<ComparisonResult> future : futures) {
+                            results.add(future.get());
+                        }
                     }
+
+                    log.info("Step 4: Writing delta script...");
+
+                    int totalChanges = results.stream()
+                            .mapToInt(r -> r.insertCount() + r.updateCount() + r.deleteCount())
+                            .sum();
+
+                    try (ProgressBar pb = new ProgressBarBuilder()
+                            .setTaskName("Writing delta SQL")
+                            .setInitialMax(Math.max(totalChanges, 1))
+                            .setStyle(ProgressBarStyle.ASCII)
+                            .build()) {
+                        writeDeltaScript(results, outputPath, pb);
+                    }
+
+                    // Print summary
+                    int totalInserts = results.stream().mapToInt(ComparisonResult::insertCount).sum();
+                    int totalUpdates = results.stream().mapToInt(ComparisonResult::updateCount).sum();
+                    int totalDeletes = results.stream().mapToInt(ComparisonResult::deleteCount).sum();
+
+                    String summary = String.format(
+                            "\n%s\nSUMMARY\n%s\nInserts:  %,d\nUpdates:  %,d\nDeletes:  %,d\nTotal:    %,d\n%s",
+                            "=".repeat(60), "=".repeat(60),
+                            totalInserts, totalUpdates, totalDeletes,
+                            totalInserts + totalUpdates + totalDeletes,
+                            "=".repeat(60));
+                    System.err.println(summary);
+                    log.info(summary);
                 }
-
-                System.err.println("Step 4: Writing delta script...");
-                
-                int totalChanges = results.stream()
-                        .mapToInt(r -> r.insertCount() + r.updateCount() + r.deleteCount())
-                        .sum();
-                
-                try (ProgressBar pb = new ProgressBarBuilder()
-                        .setTaskName("Writing delta SQL")
-                        .setInitialMax(Math.max(totalChanges, 1))
-                        .setStyle(ProgressBarStyle.ASCII)
-                        .build()) {
-                    writeDeltaScript(results, outputPath, pb);
-                }
-
-                // Print summary
-                int totalInserts = results.stream().mapToInt(ComparisonResult::insertCount).sum();
-                int totalUpdates = results.stream().mapToInt(ComparisonResult::updateCount).sum();
-                int totalDeletes = results.stream().mapToInt(ComparisonResult::deleteCount).sum();
-
-                System.err.println("\n" + "=".repeat(60));
-                System.err.println("SUMMARY");
-                System.err.println("=".repeat(60));
-                System.err.printf("Inserts:  %,d\n", totalInserts);
-                System.err.printf("Updates:  %,d\n", totalUpdates);
-                System.err.printf("Deletes:  %,d\n", totalDeletes);
-                System.err.printf("Total:    %,d\n", totalInserts + totalUpdates + totalDeletes);
-                System.err.println("=".repeat(60));
             }
         } finally {
             // Cleanup temp directory
@@ -195,7 +194,7 @@ public class DeltaGenerator {
                 if (progressBar != null) {
                     progressBar.stepTo(Math.min(bytesRead, progressBar.getMax()));
                 }
-                
+
                 List<InsertRow> rows = parser.expandInsert(insertStmt, columnsMap);
 
                 for (InsertRow row : rows) {
@@ -241,12 +240,13 @@ public class DeltaGenerator {
         }
     }
 
-    private void writeDeltaScript(List<ComparisonResult> results, String outputPath, ProgressBar progressBar) throws IOException {
+    private void writeDeltaScript(List<ComparisonResult> results, String outputPath, ProgressBar progressBar)
+            throws IOException {
         Writer out = outputPath != null
                 ? Files.newBufferedWriter(Path.of(outputPath))
                 : new OutputStreamWriter(System.out);
 
-        try {
+        try (Writer _ = outputPath != null ? out : null) {
             out.write("-- Full Delta Update Script\n");
             out.write("SET FOREIGN_KEY_CHECKS = 0;\n\n");
 
@@ -277,11 +277,6 @@ public class DeltaGenerator {
             }
 
             out.write("SET FOREIGN_KEY_CHECKS = 1;\n");
-
-        } finally {
-            if (outputPath != null) {
-                out.close();
-            }
         }
     }
 

@@ -1,11 +1,21 @@
 package com.sqldumpdiff;
 
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.NoSuchElementException;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
 import org.apache.commons.csv.CSVFormat;
 import org.apache.commons.csv.CSVParser;
 import org.apache.commons.csv.CSVRecord;
-import java.io.*;
-import java.util.*;
-import java.util.regex.*;
 
 /**
  * Parses INSERT statements from SQL dump files.
@@ -271,17 +281,18 @@ public class InsertParser {
                     .setQuote('\'')
                     .setEscape('\\')
                     .setIgnoreSurroundingSpaces(true)
-                    .build();
+                    .get();
 
-            CSVParser parser = CSVParser.parse(valuesStr, format);
-            CSVRecord record = parser.iterator().next();
+            try (CSVParser parser = CSVParser.parse(valuesStr, format)) {
+                CSVRecord record = parser.iterator().next();
 
-            List<String> values = new ArrayList<>();
-            for (String value : record) {
-                values.add(value);
+                List<String> values = new ArrayList<>();
+                for (String value : record) {
+                    values.add(value);
+                }
+                return values;
             }
-            return values;
-        } catch (Exception e) {
+        } catch (IOException | java.util.NoSuchElementException e) {
             // Fallback to simple split if CSV parsing fails
             return Arrays.asList(valuesStr.split(","));
         }

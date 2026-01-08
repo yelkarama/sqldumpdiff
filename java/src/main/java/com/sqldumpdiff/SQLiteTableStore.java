@@ -44,10 +44,10 @@ public class SQLiteTableStore {
         try (Statement stmt = connection.createStatement()) {
             stmt.execute("PRAGMA journal_mode=OFF");
             stmt.execute("PRAGMA synchronous=OFF");
-            stmt.execute("PRAGMA cache_size=-200000"); // ~200MB cache if available
+            stmt.execute("PRAGMA cache_size=-600000"); // ~600MB cache if available
             stmt.execute("PRAGMA page_size=32768"); // Bigger pages reduce I/O
             stmt.execute("PRAGMA temp_store=MEMORY");
-            stmt.execute("PRAGMA mmap_size=67108864"); // 64MB mmap window
+            stmt.execute("PRAGMA mmap_size=134217728"); // 128MB mmap window
             stmt.execute("PRAGMA busy_timeout=5000");
         }
 

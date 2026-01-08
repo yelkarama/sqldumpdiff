@@ -6,16 +6,19 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.SQLException;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
-import java.util.HashSet;
+
+import lombok.extern.java.Log;
 
 /**
  * Compares old and new table data to generate delta SQL.
  * Uses SQLite for memory-efficient storage of old records instead of HashMap.
  */
+@Log
 public class TableComparer {
 
     public ComparisonResult compare(TableComparison comparison) throws IOException, SQLException {
@@ -34,8 +37,8 @@ public class TableComparer {
 
                 long oldCount = oldStore.getRowCount();
                 if (oldCount == 0) {
-                    System.err.printf("[diag] Table %s: WARNING - no old rows loaded. PK columns: %s\n",
-                            comparison.tableName(), String.join(", ", comparison.pkColumns()));
+                    log.fine(() -> "Table " + comparison.tableName() + ": No old rows loaded. PK columns: " +
+                            String.join(", ", comparison.pkColumns()));
                 }
             }
 
@@ -107,7 +110,6 @@ public class TableComparer {
                 }
             }
 
-                    
             // Handle deletions: emit any old row hashes that were never matched
             Set<String> allOldHashes = oldStore.getAllPkHashes();
             for (String pkHash : allOldHashes) {
@@ -139,7 +141,6 @@ public class TableComparer {
 
     private void loadTableFileToSQLite(Path file, String table, SQLiteTableStore store)
 
-            
             throws IOException, SQLException {
         // Read rows and insert into SQLite
         try (BufferedReader reader = Files.newBufferedReader(file)) {
