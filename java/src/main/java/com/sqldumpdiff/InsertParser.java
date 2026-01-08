@@ -6,7 +6,6 @@ import org.apache.commons.csv.CSVRecord;
 import java.io.*;
 import java.util.*;
 import java.util.regex.*;
-import java.util.stream.StreamSupport;
 
 /**
  * Parses INSERT statements from SQL dump files.
@@ -138,8 +137,8 @@ public class InsertParser {
         }
         String table = tableMatcher.group(1);
 
-        List<String> columns = null;
-        int valuesStartPos = 0;
+        List<String> columns;
+        int valuesStartPos;
         boolean hasExplicitCols = false;
 
         Matcher colMatcher = COLUMNS_LIST.matcher(normalized);

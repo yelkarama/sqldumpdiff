@@ -8,6 +8,7 @@ import java.io.OutputStreamWriter;
 import java.io.Writer;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -234,7 +235,7 @@ public class DeltaGenerator {
         try {
             TableComparer comparer = new TableComparer();
             return comparer.compare(comparison);
-        } catch (IOException e) {
+        } catch (IOException | SQLException e) {
             System.err.println("Error comparing table " + comparison.tableName() + ": " + e.getMessage());
             return new ComparisonResult(comparison.tableName(), "", "", 0, 0, 0);
         }

@@ -157,7 +157,6 @@ public class SchemaParser {
 
         // Split by top-level commas
         int commaDepth = 0;
-        inQuote = false;
         quoteChar = 0;
         StringBuilder current = new StringBuilder();
 
