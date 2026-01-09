@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/schollz/progressbar/v3"
 	"github.com/younes/sqldumpdiff/internal/logger"
 )
 
@@ -134,15 +135,27 @@ func (ip *InsertParser) ParseInserts(filename string, columns map[string][]strin
 	fileSize := fi.Size()
 	logger.Debug("ParseInserts: File size: %d bytes", fileSize)
 
+	// Create progress bar
+	bar := progressbar.NewOptions64(
+		fileSize,
+		progressbar.OptionSetDescription(fmt.Sprintf("Parsing %s", filename)),
+		progressbar.OptionShowBytes(true),
+		progressbar.OptionShowCount(),
+	)
+	defer bar.Close()
+
 	tableRows := make(map[string][]*InsertRow)
 	scanner := bufio.NewScanner(file)
 	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024) // 16MB buffer for large lines
 
 	acc := &InsertAccumulator{}
 	rowsExtracted := 0
+	bytesRead := int64(0)
 
 	for scanner.Scan() {
 		line := scanner.Text()
+		bytesRead += int64(len(line)) + 1 // +1 for newline
+		bar.Add64(int64(len(line)) + 1)
 
 		// Process the line and get any complete INSERT statements
 		statements := acc.ProcessLine(line)

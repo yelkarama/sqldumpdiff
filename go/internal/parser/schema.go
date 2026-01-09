@@ -2,10 +2,12 @@ package parser
 
 import (
 	"bufio"
+	"fmt"
 	"os"
 	"regexp"
 	"strings"
 
+	"github.com/schollz/progressbar/v3"
 	"github.com/younes/sqldumpdiff/internal/logger"
 )
 
@@ -36,6 +38,23 @@ func (sp *SchemaParser) ParseSchemas(filename string) (map[string][]string, erro
 	}
 	defer file.Close()
 
+	// Get file size for progress bar
+	fi, err := file.Stat()
+	if err != nil {
+		logger.Error("ParseSchemas: Failed to stat file: %v", err)
+		return nil, err
+	}
+	fileSize := fi.Size()
+
+	// Create progress bar
+	bar := progressbar.NewOptions64(
+		fileSize,
+		progressbar.OptionSetDescription(fmt.Sprintf("Schema %s", filename)),
+		progressbar.OptionShowBytes(true),
+		progressbar.OptionShowCount(),
+	)
+	defer bar.Close()
+
 	pkMap := make(map[string][]string)
 	scanner := bufio.NewScanner(file)
 	// Increase buffer to handle very long lines in large CREATE statements
@@ -47,6 +66,7 @@ func (sp *SchemaParser) ParseSchemas(filename string) (map[string][]string, erro
 
 	for scanner.Scan() {
 		line := scanner.Text()
+		bar.Add64(int64(len(line)) + 1) // +1 for newline
 
 		if sp.createTableRegex.MatchString(strings.ToUpper(line)) {
 			matches := sp.createTableRegex.FindStringSubmatch(strings.ToUpper(line))
@@ -128,6 +148,23 @@ func (sp *SchemaParser) ParseColumns(filename string) (map[string][]string, erro
 	}
 	defer file.Close()
 
+	// Get file size for progress bar
+	fi, err := file.Stat()
+	if err != nil {
+		logger.Error("ParseColumns: Failed to stat file: %v", err)
+		return nil, err
+	}
+	fileSize := fi.Size()
+
+	// Create progress bar
+	bar := progressbar.NewOptions64(
+		fileSize,
+		progressbar.OptionSetDescription(fmt.Sprintf("Columns %s", filename)),
+		progressbar.OptionShowBytes(true),
+		progressbar.OptionShowCount(),
+	)
+	defer bar.Close()
+
 	columnsMap := make(map[string][]string)
 	scanner := bufio.NewScanner(file)
 	// Increase buffer to handle very long lines in large CREATE statements
@@ -141,6 +178,7 @@ func (sp *SchemaParser) ParseColumns(filename string) (map[string][]string, erro
 
 	for scanner.Scan() {
 		line := scanner.Text()
+		bar.Add64(int64(len(line)) + 1) // +1 for newline
 
 		if sp.createTableRegex.MatchString(line) {
 			matches := sp.createTableRegex.FindStringSubmatch(line)

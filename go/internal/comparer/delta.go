@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/schollz/progressbar/v3"
 	"github.com/younes/sqldumpdiff/internal/logger"
 	"github.com/younes/sqldumpdiff/internal/parser"
 	"github.com/younes/sqldumpdiff/internal/store"
@@ -43,21 +44,42 @@ func (dg *DeltaGenerator) GenerateDelta(oldFile, newFile string) ([]*ComparisonR
 	logger.Debug("GenerateDelta: Starting delta generation")
 	insertParser := parser.NewInsertParser()
 
-	// Parse old and new files
-	logger.Debug("GenerateDelta: Parsing old file: %s", oldFile)
-	oldRows, err := insertParser.ParseInserts(oldFile, dg.oldColumnsMap)
-	if err != nil {
-		logger.Error("GenerateDelta: Error parsing old file: %v", err)
-		return nil, fmt.Errorf("parsing old file: %w", err)
+	// Parse old and new files in parallel
+	type parseResult struct {
+		rows map[string][]*parser.InsertRow
+		err  error
 	}
+
+	oldCh := make(chan parseResult, 1)
+	newCh := make(chan parseResult, 1)
+
+	logger.Debug("GenerateDelta: Parsing old file (parallel): %s", oldFile)
+	go func() {
+		rows, err := insertParser.ParseInserts(oldFile, dg.oldColumnsMap)
+		oldCh <- parseResult{rows: rows, err: err}
+	}()
+
+	logger.Debug("GenerateDelta: Parsing new file (parallel): %s", newFile)
+	go func() {
+		rows, err := insertParser.ParseInserts(newFile, dg.newColumnsMap)
+		newCh <- parseResult{rows: rows, err: err}
+	}()
+
+	// Wait for both results
+	oldRes := <-oldCh
+	if oldRes.err != nil {
+		logger.Error("GenerateDelta: Error parsing old file: %v", oldRes.err)
+		return nil, fmt.Errorf("parsing old file: %w", oldRes.err)
+	}
+	oldRows := oldRes.rows
 	logger.Debug("GenerateDelta: Old file has %d tables", len(oldRows))
 
-	logger.Debug("GenerateDelta: Parsing new file: %s", newFile)
-	newRows, err := insertParser.ParseInserts(newFile, dg.newColumnsMap)
-	if err != nil {
-		logger.Error("GenerateDelta: Error parsing new file: %v", err)
-		return nil, fmt.Errorf("parsing new file: %w", err)
+	newRes := <-newCh
+	if newRes.err != nil {
+		logger.Error("GenerateDelta: Error parsing new file: %v", newRes.err)
+		return nil, fmt.Errorf("parsing new file: %w", newRes.err)
 	}
+	newRows := newRes.rows
 	logger.Debug("GenerateDelta: New file has %d tables", len(newRows))
 
 	// Get all tables
@@ -73,10 +95,20 @@ func (dg *DeltaGenerator) GenerateDelta(oldFile, newFile string) ([]*ComparisonR
 	// Compare each table
 	var results []*ComparisonResult
 	tablesCompared := 0
+
+	// Create progress bar for table comparison
+	bar := progressbar.NewOptions(len(allTables),
+		progressbar.OptionSetDescription("Comparing tables"),
+		progressbar.OptionShowCount(),
+		progressbar.OptionSetWidth(40),
+	)
+	defer bar.Close()
+
 	for table := range allTables {
 		pkCols, hasPK := dg.pkMap[table]
 		if !hasPK {
 			logger.Debug("GenerateDelta: Skipping table %s - no PRIMARY KEY defined", table)
+			bar.Add(1)
 			continue
 		}
 
@@ -85,6 +117,7 @@ func (dg *DeltaGenerator) GenerateDelta(oldFile, newFile string) ([]*ComparisonR
 		results = append(results, result)
 		logger.Debug("GenerateDelta: Table %s comparison done - %d inserts, %d updates, %d deletes", table, result.InsertCount, result.UpdateCount, result.DeleteCount)
 		tablesCompared++
+		bar.Add(1)
 	}
 
 	// Sort results by table name

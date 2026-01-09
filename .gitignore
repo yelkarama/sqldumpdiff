@@ -50,3 +50,4 @@ full_delta_update.sql
 *.gz
 *.xz
 *.egg-info/
+go/sqldumpdiff
