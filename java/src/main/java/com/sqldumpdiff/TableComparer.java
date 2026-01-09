@@ -173,10 +173,23 @@ public class TableComparer {
     }
 
     private String normalizeNull(String val) {
-        if (val == null || "NULL".equalsIgnoreCase(val)) {
+        if (val == null) {
             return null;
         }
-        return val;
+
+        String trimmed = val.trim();
+        if ("NULL".equalsIgnoreCase(trimmed)) {
+            return null;
+        }
+
+        // If the value is enclosed in single quotes, strip them and unescape doubled
+        // quotes
+        if (trimmed.length() >= 2 && trimmed.startsWith("'") && trimmed.endsWith("'")) {
+            trimmed = trimmed.substring(1, trimmed.length() - 1);
+            trimmed = trimmed.replace("''", "'");
+        }
+
+        return trimmed;
     }
 
     private String buildWhereClause(List<String> pkColumns, Map<String, String> data) {
