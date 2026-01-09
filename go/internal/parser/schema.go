@@ -7,7 +7,10 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/schollz/progressbar/v3"
+	"path/filepath"
+
+	"github.com/vbauerster/mpb/v8"
+	"github.com/vbauerster/mpb/v8/decor"
 	"github.com/younes/sqldumpdiff/internal/logger"
 )
 
@@ -29,7 +32,7 @@ func NewSchemaParser() *SchemaParser {
 }
 
 // ParseSchemas extracts primary key information from CREATE TABLE statements
-func (sp *SchemaParser) ParseSchemas(filename string) (map[string][]string, error) {
+func (sp *SchemaParser) ParseSchemas(filename string, p *mpb.Progress) (map[string][]string, error) {
 	logger.Debug("ParseSchemas: Opening file %s", filename)
 	file, err := os.Open(filename)
 	if err != nil {
@@ -46,14 +49,20 @@ func (sp *SchemaParser) ParseSchemas(filename string) (map[string][]string, erro
 	}
 	fileSize := fi.Size()
 
-	// Create progress bar
-	bar := progressbar.NewOptions64(
-		fileSize,
-		progressbar.OptionSetDescription(fmt.Sprintf("Schema %s", filename)),
-		progressbar.OptionShowBytes(true),
-		progressbar.OptionShowCount(),
-	)
-	defer bar.Close()
+	var bar *mpb.Bar
+	if p != nil {
+		bar = p.New(
+			fileSize,
+			mpb.BarStyle().Lbound("[").Filler("█").Tip("█").Padding(" ").Rbound("]"),
+			mpb.PrependDecorators(
+				decor.Name(fmt.Sprintf("Schema %s", filepath.Base(filename)), decor.WC{W: 20, C: decor.DindentRight | decor.DextraSpace}),
+				decor.CountersKibiByte("% .2f / % .2f", decor.WC{W: 18, C: decor.DindentRight | decor.DextraSpace}),
+			),
+			mpb.AppendDecorators(
+				decor.Percentage(decor.WC{W: 5}),
+			),
+		)
+	}
 
 	pkMap := make(map[string][]string)
 	scanner := bufio.NewScanner(file)
@@ -64,9 +73,14 @@ func (sp *SchemaParser) ParseSchemas(filename string) (map[string][]string, erro
 	var tableBuffer strings.Builder
 	tablesProcessed := 0
 
+	var bytesRead int64
 	for scanner.Scan() {
 		line := scanner.Text()
-		bar.Add64(int64(len(line)) + 1) // +1 for newline
+		lineSize := int64(len(line)) + 1
+		bytesRead += lineSize
+		if bar != nil {
+			bar.IncrBy(int(lineSize))
+		}
 
 		if sp.createTableRegex.MatchString(strings.ToUpper(line)) {
 			matches := sp.createTableRegex.FindStringSubmatch(strings.ToUpper(line))
@@ -133,13 +147,16 @@ func (sp *SchemaParser) ParseSchemas(filename string) (map[string][]string, erro
 		logger.Error("ParseSchemas: Scanner error: %v", err)
 		return nil, err
 	}
+	if bar != nil {
+		bar.SetTotal(bytesRead, true)
+	}
 
 	logger.Debug("ParseSchemas: Processed %d tables, found %d with primary keys", tablesProcessed, len(pkMap))
 	return pkMap, nil
 }
 
 // ParseColumns extracts column names from CREATE TABLE statements
-func (sp *SchemaParser) ParseColumns(filename string) (map[string][]string, error) {
+func (sp *SchemaParser) ParseColumns(filename string, p *mpb.Progress) (map[string][]string, error) {
 	logger.Debug("ParseColumns: Opening file %s", filename)
 	file, err := os.Open(filename)
 	if err != nil {
@@ -156,14 +173,20 @@ func (sp *SchemaParser) ParseColumns(filename string) (map[string][]string, erro
 	}
 	fileSize := fi.Size()
 
-	// Create progress bar
-	bar := progressbar.NewOptions64(
-		fileSize,
-		progressbar.OptionSetDescription(fmt.Sprintf("Columns %s", filename)),
-		progressbar.OptionShowBytes(true),
-		progressbar.OptionShowCount(),
-	)
-	defer bar.Close()
+	var bar *mpb.Bar
+	if p != nil {
+		bar = p.New(
+			fileSize,
+			mpb.BarStyle().Lbound("[").Filler("█").Tip("█").Padding(" ").Rbound("]"),
+			mpb.PrependDecorators(
+				decor.Name(fmt.Sprintf("Columns %s", filepath.Base(filename)), decor.WC{W: 20, C: decor.DindentRight | decor.DextraSpace}),
+				decor.CountersKibiByte("% .2f / % .2f", decor.WC{W: 18, C: decor.DindentRight | decor.DextraSpace}),
+			),
+			mpb.AppendDecorators(
+				decor.Percentage(decor.WC{W: 5}),
+			),
+		)
+	}
 
 	columnsMap := make(map[string][]string)
 	scanner := bufio.NewScanner(file)
@@ -176,9 +199,14 @@ func (sp *SchemaParser) ParseColumns(filename string) (map[string][]string, erro
 
 	columnLineRegex := regexp.MustCompile("`" + `(\w+)` + "`" + `\s+(\w+)`)
 
+	var bytesRead int64
 	for scanner.Scan() {
 		line := scanner.Text()
-		bar.Add64(int64(len(line)) + 1) // +1 for newline
+		lineSize := int64(len(line)) + 1
+		bytesRead += lineSize
+		if bar != nil {
+			bar.IncrBy(int(lineSize))
+		}
 
 		if sp.createTableRegex.MatchString(line) {
 			matches := sp.createTableRegex.FindStringSubmatch(line)
@@ -241,6 +269,9 @@ func (sp *SchemaParser) ParseColumns(filename string) (map[string][]string, erro
 	if err := scanner.Err(); err != nil {
 		logger.Error("ParseColumns: Scanner error: %v", err)
 		return nil, err
+	}
+	if bar != nil {
+		bar.SetTotal(bytesRead, true)
 	}
 
 	logger.Debug("ParseColumns: Processed %d tables, extracted columns from %d", tablesProcessed, len(columnsMap))

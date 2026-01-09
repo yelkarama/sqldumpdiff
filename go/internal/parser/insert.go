@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
-	"github.com/schollz/progressbar/v3"
+	"github.com/vbauerster/mpb/v8"
+	"github.com/vbauerster/mpb/v8/decor"
 	"github.com/younes/sqldumpdiff/internal/logger"
 )
 
@@ -117,7 +119,7 @@ func (acc *InsertAccumulator) Finalize() []string {
 }
 
 // ParseInserts reads INSERT statements from a file with progress reporting
-func (ip *InsertParser) ParseInserts(filename string, columns map[string][]string) (map[string][]*InsertRow, error) {
+func (ip *InsertParser) ParseInserts(filename string, columns map[string][]string, p *mpb.Progress) (map[string][]*InsertRow, error) {
 	logger.Debug("ParseInserts: Opening file %s", filename)
 	file, err := os.Open(filename)
 	if err != nil {
@@ -135,14 +137,20 @@ func (ip *InsertParser) ParseInserts(filename string, columns map[string][]strin
 	fileSize := fi.Size()
 	logger.Debug("ParseInserts: File size: %d bytes", fileSize)
 
-	// Create progress bar
-	bar := progressbar.NewOptions64(
-		fileSize,
-		progressbar.OptionSetDescription(fmt.Sprintf("Parsing %s", filename)),
-		progressbar.OptionShowBytes(true),
-		progressbar.OptionShowCount(),
-	)
-	defer bar.Close()
+	var bar *mpb.Bar
+	if p != nil {
+		bar = p.New(
+			fileSize,
+			mpb.BarStyle().Lbound("[").Filler("█").Tip("█").Padding(" ").Rbound("]"),
+			mpb.PrependDecorators(
+				decor.Name(fmt.Sprintf("Parsing %s", filepath.Base(filename)), decor.WC{W: 20, C: decor.DindentRight | decor.DextraSpace}),
+				decor.CountersKibiByte("% .2f / % .2f", decor.WC{W: 18, C: decor.DindentRight | decor.DextraSpace}),
+			),
+			mpb.AppendDecorators(
+				decor.Percentage(decor.WC{W: 5}),
+			),
+		)
+	}
 
 	tableRows := make(map[string][]*InsertRow)
 	scanner := bufio.NewScanner(file)
@@ -151,11 +159,13 @@ func (ip *InsertParser) ParseInserts(filename string, columns map[string][]strin
 	acc := &InsertAccumulator{}
 	rowsExtracted := 0
 	bytesRead := int64(0)
-
 	for scanner.Scan() {
 		line := scanner.Text()
-		bytesRead += int64(len(line)) + 1 // +1 for newline
-		bar.Add64(int64(len(line)) + 1)
+		lineSize := int64(len(line)) + 1
+		bytesRead += lineSize // +1 for newline
+		if bar != nil {
+			bar.IncrBy(int(lineSize))
+		}
 
 		// Process the line and get any complete INSERT statements
 		statements := acc.ProcessLine(line)
@@ -191,6 +201,9 @@ func (ip *InsertParser) ParseInserts(filename string, columns map[string][]strin
 	if err := scanner.Err(); err != nil {
 		logger.Error("ParseInserts: Scanner error: %v", err)
 		return nil, err
+	}
+	if bar != nil {
+		bar.SetTotal(bytesRead, true)
 	}
 
 	logger.Debug("ParseInserts: Processed %d INSERT statements, extracted %d rows across %d tables", acc.statementsProcessed, rowsExtracted, len(tableRows))

@@ -66,23 +66,23 @@ func main() {
 
 	// Parse schemas in parallel
 	go func() {
-		pk, err := schemaParser.ParseSchemas(oldFile)
+		pk, err := schemaParser.ParseSchemas(oldFile, p)
 		oldSchemaCh <- schemaRes{pkMap: pk, err: err}
 	}()
 
 	go func() {
-		pk, err := schemaParser.ParseSchemas(newFile)
+		pk, err := schemaParser.ParseSchemas(newFile, p)
 		newSchemaCh <- schemaRes{pkMap: pk, err: err}
 	}()
 
 	// Parse columns in parallel
 	go func() {
-		cols, err := schemaParser.ParseColumns(oldFile)
+		cols, err := schemaParser.ParseColumns(oldFile, p)
 		oldColsCh <- colsRes{cols: cols, err: err}
 	}()
 
 	go func() {
-		cols, err := schemaParser.ParseColumns(newFile)
+		cols, err := schemaParser.ParseColumns(newFile, p)
 		newColsCh <- colsRes{cols: cols, err: err}
 	}()
 
@@ -111,9 +111,6 @@ func main() {
 	}
 	newColsMap := newColsRes.cols
 
-	// Close progress container
-	p.Wait()
-
 	// Merge PK maps (prefer new file PKs)
 	for table, pk := range newPKMap {
 		oldPKMap[table] = pk
@@ -121,7 +118,7 @@ func main() {
 
 	// Generate delta
 	dg := comparer.NewDeltaGenerator(oldPKMap, oldColsMap, newColsMap)
-	results, err := dg.GenerateDelta(oldFile, newFile)
+	results, err := dg.GenerateDelta(oldFile, newFile, p)
 	if err != nil {
 		log.Fatalf("Error generating delta: %v", err)
 	}
@@ -144,9 +141,12 @@ func main() {
 	fmt.Printf("  Total:   %d\n", totalInserts+totalUpdates+totalDeletes)
 
 	// Write delta script
-	if err := comparer.WriteDeltaScript(results, deltaFile); err != nil {
+	if err := comparer.WriteDeltaScript(results, deltaFile, p); err != nil {
 		log.Fatalf("Error writing delta script: %v", err)
 	}
+
+	// Ensure progress bars are fully rendered before exit
+	p.Wait()
 
 	logger.Debug("main: Delta generation complete")
 }

@@ -7,7 +7,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/schollz/progressbar/v3"
+	"github.com/vbauerster/mpb/v8"
+	"github.com/vbauerster/mpb/v8/decor"
 	"github.com/younes/sqldumpdiff/internal/logger"
 	"github.com/younes/sqldumpdiff/internal/parser"
 	"github.com/younes/sqldumpdiff/internal/store"
@@ -40,7 +41,7 @@ func NewDeltaGenerator(pkMap, oldColumnsMap, newColumnsMap map[string][]string) 
 }
 
 // GenerateDelta compares old and new dumps and generates delta
-func (dg *DeltaGenerator) GenerateDelta(oldFile, newFile string) ([]*ComparisonResult, error) {
+func (dg *DeltaGenerator) GenerateDelta(oldFile, newFile string, p *mpb.Progress) ([]*ComparisonResult, error) {
 	logger.Debug("GenerateDelta: Starting delta generation")
 	insertParser := parser.NewInsertParser()
 
@@ -55,13 +56,13 @@ func (dg *DeltaGenerator) GenerateDelta(oldFile, newFile string) ([]*ComparisonR
 
 	logger.Debug("GenerateDelta: Parsing old file (parallel): %s", oldFile)
 	go func() {
-		rows, err := insertParser.ParseInserts(oldFile, dg.oldColumnsMap)
+		rows, err := insertParser.ParseInserts(oldFile, dg.oldColumnsMap, p)
 		oldCh <- parseResult{rows: rows, err: err}
 	}()
 
 	logger.Debug("GenerateDelta: Parsing new file (parallel): %s", newFile)
 	go func() {
-		rows, err := insertParser.ParseInserts(newFile, dg.newColumnsMap)
+		rows, err := insertParser.ParseInserts(newFile, dg.newColumnsMap, p)
 		newCh <- parseResult{rows: rows, err: err}
 	}()
 
@@ -96,19 +97,28 @@ func (dg *DeltaGenerator) GenerateDelta(oldFile, newFile string) ([]*ComparisonR
 	var results []*ComparisonResult
 	tablesCompared := 0
 
-	// Create progress bar for table comparison
-	bar := progressbar.NewOptions(len(allTables),
-		progressbar.OptionSetDescription("Comparing tables"),
-		progressbar.OptionShowCount(),
-		progressbar.OptionSetWidth(40),
-	)
-	defer bar.Close()
+	var bar *mpb.Bar
+	if p != nil {
+		bar = p.New(
+			int64(len(allTables)),
+			mpb.BarStyle().Lbound("[").Filler("█").Tip("█").Padding(" ").Rbound("]"),
+			mpb.PrependDecorators(
+				decor.Name("Comparing tables", decor.WC{W: 20, C: decor.DindentRight | decor.DextraSpace}),
+				decor.CountersNoUnit("%d / %d", decor.WC{W: 18, C: decor.DindentRight | decor.DextraSpace}),
+			),
+			mpb.AppendDecorators(
+				decor.Percentage(decor.WC{W: 5}),
+			),
+		)
+	}
 
 	for table := range allTables {
 		pkCols, hasPK := dg.pkMap[table]
 		if !hasPK {
 			logger.Debug("GenerateDelta: Skipping table %s - no PRIMARY KEY defined", table)
-			bar.Add(1)
+			if bar != nil {
+				bar.IncrBy(1)
+			}
 			continue
 		}
 
@@ -117,7 +127,12 @@ func (dg *DeltaGenerator) GenerateDelta(oldFile, newFile string) ([]*ComparisonR
 		results = append(results, result)
 		logger.Debug("GenerateDelta: Table %s comparison done - %d inserts, %d updates, %d deletes", table, result.InsertCount, result.UpdateCount, result.DeleteCount)
 		tablesCompared++
-		bar.Add(1)
+		if bar != nil {
+			bar.IncrBy(1)
+		}
+	}
+	if bar != nil {
+		bar.SetTotal(int64(len(allTables)), true)
 	}
 
 	// Sort results by table name
