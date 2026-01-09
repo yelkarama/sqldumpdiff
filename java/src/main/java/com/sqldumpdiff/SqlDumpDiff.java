@@ -1,12 +1,15 @@
 package com.sqldumpdiff;
 
-import lombok.extern.java.Log;
-
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.file.Files;
+import java.nio.file.Paths;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.logging.LogManager;
+import java.util.stream.Stream;
+
+import lombok.extern.java.Log;
 
 /**
  * High-performance SQL dump comparison tool using Java 21+ virtual threads.
@@ -18,11 +21,10 @@ import java.util.logging.LogManager;
 public class SqlDumpDiff {
 
     static {
-        // Load logging configuration from classpath
+        // Load logging configuration from classpath but don't log yet
         try (InputStream loggingConfig = SqlDumpDiff.class.getResourceAsStream("/logging.properties")) {
             if (loggingConfig != null) {
                 LogManager.getLogManager().readConfiguration(loggingConfig);
-                log.info("Logging configuration loaded from logging.properties");
             } else {
                 System.err.println("Warning: logging.properties not found, using default configuration");
             }
@@ -31,34 +33,84 @@ public class SqlDumpDiff {
         }
     }
 
+    private static void configureLogging(boolean debug) {
+        java.util.logging.Logger rootLogger = java.util.logging.Logger.getLogger("");
+
+        if (!debug) {
+            // Remove console handler when not in debug mode - logs only go to file
+            for (java.util.logging.Handler handler : rootLogger.getHandlers()) {
+                if (handler instanceof java.util.logging.ConsoleHandler) {
+                    rootLogger.removeHandler(handler);
+                }
+            }
+        }
+
+        // Now log the configuration loading
+        log.info("Logging configuration loaded - debug mode: " + debug);
+    }
+
     static void main(String[] args) {
-        if (args.length < 2) {
-            System.err.println("Usage: sqldumpdiff <old_dump.sql> <new_dump.sql> [output.sql]");
+        // Parse debug flag first
+        boolean debug = false;
+        int argOffset = 0;
+        if (args.length > 0 && args[0].equals("--debug")) {
+            debug = true;
+            argOffset = 1;
+        }
+
+        // Configure logging based on debug flag (before any logging happens)
+        configureLogging(debug);
+
+        if (args.length < 2 + argOffset) {
+            System.err.println("Usage: sqldumpdiff [--debug] <old_dump.sql> <new_dump.sql> [output.sql]");
+            System.err.println("       --debug: Enable detailed console logging and disable progress bars");
             System.err.println("       If output.sql is not provided, delta SQL is printed to stdout");
             System.exit(1);
         }
 
-        String oldFile = args[0];
-        String newFile = args[1];
-        String outputFile = args.length > 2 ? args[2] : null;
+        String oldFile = args[argOffset];
+        String newFile = args[argOffset + 1];
+        String outputFile = args.length > argOffset + 2 ? args[argOffset + 2] : null;
 
         try {
             Instant start = Instant.now();
             log.info("Starting SQL dump comparison");
-            log.info("Old dump: " + oldFile);
-            log.info("New dump: " + newFile);
+            log.log(java.util.logging.Level.INFO, "Old dump: {0}", oldFile);
+            log.log(java.util.logging.Level.INFO, "New dump: {0}", newFile);
             if (outputFile != null) {
-                log.info("Output file: " + outputFile);
+                log.log(java.util.logging.Level.INFO, "Output file: {0}", outputFile);
             }
 
             DeltaGenerator generator = new DeltaGenerator();
-            generator.generateDelta(oldFile, newFile, outputFile);
+            generator.generateDelta(oldFile, newFile, outputFile, debug);
 
             Duration duration = Duration.between(start, Instant.now());
             System.err.printf("\nCompleted in %d.%03ds\n",
                     duration.toSeconds(),
                     duration.toMillisPart());
-            log.info("Comparison completed successfully in " + duration.toMillis() + "ms");
+
+            // Flush all logging handlers to ensure file is written
+            java.util.logging.Logger rootLogger = java.util.logging.Logger.getLogger("");
+            for (java.util.logging.Handler handler : rootLogger.getHandlers()) {
+                handler.flush();
+            }
+
+            // Find and print the actual logfile only in non-debug mode
+            if (!debug) {
+                try (Stream<java.nio.file.Path> paths = Files.list(Paths.get("/tmp"))) {
+                    java.nio.file.Path logFile = paths
+                            .filter(p -> p.getFileName().toString().startsWith("sqldumpdiff"))
+                            .max((a, b) -> Long.compare(a.toFile().lastModified(), b.toFile().lastModified()))
+                            .orElse(null);
+                    if (logFile != null) {
+                        System.err.println("Log file: " + logFile);
+                    }
+                } catch (IOException ignored) {
+                    // If we can't find the file, that's okay
+                }
+            }
+
+            log.log(java.util.logging.Level.INFO, "Comparison completed successfully in {0}ms", duration.toMillis());
 
         } catch (IOException | InterruptedException | java.util.concurrent.ExecutionException e) {
             log.log(java.util.logging.Level.SEVERE, "Fatal error during comparison", e);

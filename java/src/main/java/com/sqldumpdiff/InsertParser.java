@@ -13,10 +13,6 @@ import java.util.NoSuchElementException;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-import org.apache.commons.csv.CSVFormat;
-import org.apache.commons.csv.CSVParser;
-import org.apache.commons.csv.CSVRecord;
-
 /**
  * Parses INSERT statements from SQL dump files.
  * Handles multi-line and multi-row INSERT statements.
@@ -275,26 +271,56 @@ public class InsertParser {
     }
 
     private List<String> parseValues(String valuesStr) {
-        try {
-            // Use Apache Commons CSV with SQL-style quoting
-            CSVFormat format = CSVFormat.DEFAULT.builder()
-                    .setQuote('\'')
-                    .setEscape('\\')
-                    .setIgnoreSurroundingSpaces(true)
-                    .get();
+        List<String> values = new ArrayList<>();
+        StringBuilder current = new StringBuilder();
+        boolean inSingleQuote = false;
+        boolean inDoubleQuote = false;
+        boolean escapeNext = false;
 
-            try (CSVParser parser = CSVParser.parse(valuesStr, format)) {
-                CSVRecord record = parser.iterator().next();
+        for (int i = 0; i < valuesStr.length(); i++) {
+            char c = valuesStr.charAt(i);
 
-                List<String> values = new ArrayList<>();
-                for (String value : record) {
-                    values.add(value);
-                }
-                return values;
+            if (escapeNext) {
+                current.append(c);
+                escapeNext = false;
+                continue;
             }
-        } catch (IOException | java.util.NoSuchElementException e) {
-            // Fallback to simple split if CSV parsing fails
-            return Arrays.asList(valuesStr.split(","));
+
+            if (c == '\\') {
+                current.append(c);
+                escapeNext = true;
+                continue;
+            }
+
+            if (c == '\'' && !inDoubleQuote) {
+                current.append(c);
+                inSingleQuote = !inSingleQuote;
+                continue;
+            }
+
+            if (c == '"' && !inSingleQuote) {
+                current.append(c);
+                inDoubleQuote = !inDoubleQuote;
+                continue;
+            }
+
+            if (c == ',' && !inSingleQuote && !inDoubleQuote) {
+                // End of current value
+                String value = current.toString().trim();
+                values.add(value);
+                current = new StringBuilder();
+                continue;
+            }
+
+            current.append(c);
         }
+
+        // Add the last value
+        if (current.length() > 0) {
+            String value = current.toString().trim();
+            values.add(value);
+        }
+
+        return values;
     }
 }
