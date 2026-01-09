@@ -178,6 +178,7 @@ public class DeltaGenerator {
         InsertParser parser = new InsertParser();
         Map<String, BufferedWriter> writers = new HashMap<>();
         Map<String, Path> tablePaths = new HashMap<>();
+        Map<String, Long> rowCounts = new HashMap<>();
         long bytesRead = 0;
 
         try (BufferedReader reader = Files.newBufferedReader(dumpFile)) {
@@ -206,12 +207,22 @@ public class DeltaGenerator {
                         Path tablePath = tempDir.resolve(label + "_" + sanitizeFilename(row.table()) + ".jsonl");
                         tablePaths.put(row.table(), tablePath);
                         writers.put(row.table(), Files.newBufferedWriter(tablePath));
+                        rowCounts.put(row.table(), 0L);
+                        log.log(java.util.logging.Level.FINE, "Processing {0} table: {1}",
+                                new Object[] { label, row.table() });
                     }
 
                     String json = row.toJson();
                     writers.get(row.table()).write(json);
                     writers.get(row.table()).newLine();
+                    rowCounts.put(row.table(), rowCounts.get(row.table()) + 1);
                 }
+            }
+
+            // Log row counts for each table
+            for (Map.Entry<String, Long> entry : rowCounts.entrySet()) {
+                log.log(java.util.logging.Level.FINE, "Table {0} ({1}): {2} rows",
+                        new Object[] { entry.getKey(), label, entry.getValue() });
             }
 
             // Ensure progress bar reaches 100%
@@ -230,7 +241,16 @@ public class DeltaGenerator {
     private ComparisonResult compareTable(TableComparison comparison) {
         try {
             TableComparer comparer = new TableComparer();
-            return comparer.compare(comparison);
+            ComparisonResult result = comparer.compare(comparison);
+
+            // Log detailed comparison results
+            if (result.insertCount() > 0 || result.updateCount() > 0 || result.deleteCount() > 0) {
+                log.log(java.util.logging.Level.FINE, "Table {0}: {1} inserts, {2} updates, {3} deletes",
+                        new Object[] { result.tableName(), result.insertCount(), result.updateCount(),
+                                result.deleteCount() });
+            }
+
+            return result;
         } catch (IOException | SQLException e) {
             System.err.println("Error comparing table " + comparison.tableName() + ": " + e.getMessage());
             return new ComparisonResult(comparison.tableName(), "", "", 0, 0, 0);

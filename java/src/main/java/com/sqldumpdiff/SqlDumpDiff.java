@@ -43,6 +43,17 @@ public class SqlDumpDiff {
                     rootLogger.removeHandler(handler);
                 }
             }
+        } else {
+            // Enable FINE level logging in debug mode for detailed output
+            java.util.logging.Logger sqldumpdiffLogger = java.util.logging.Logger.getLogger("com.sqldumpdiff");
+            sqldumpdiffLogger.setLevel(java.util.logging.Level.FINE);
+
+            // Set all handlers to FINE level too
+            for (java.util.logging.Handler handler : rootLogger.getHandlers()) {
+                if (handler instanceof java.util.logging.ConsoleHandler) {
+                    handler.setLevel(java.util.logging.Level.FINE);
+                }
+            }
         }
 
         // Now log the configuration loading
