@@ -391,6 +391,7 @@ func splitValueGroupsWithQuotes(valuesPart string) []string {
 }
 
 // parseValuesWithQuotes parses individual values while respecting quote boundaries
+// Keeps quotes in values to match Java parser behavior for proper comparison
 func parseValuesWithQuotes(valuesStr string) []string {
 	var values []string
 	var buf strings.Builder
@@ -411,14 +412,16 @@ func parseValuesWithQuotes(valuesStr string) []string {
 			continue
 		}
 		if c == '\'' && !inDoubleQuote && depth == 0 {
+			buf.WriteRune(c) // Include the quote in the value (unlike previous version)
 			inSingleQuote = !inSingleQuote
-			continue // Don't include the quote in the value
+			continue
 		}
 		if c == '"' && !inSingleQuote && depth == 0 {
+			buf.WriteRune(c) // Include the quote in the value
 			inDoubleQuote = !inDoubleQuote
 			continue
 		}
-		
+
 		// Track parenthesis for nested structures
 		if !inSingleQuote && !inDoubleQuote {
 			if c == '(' {
@@ -427,7 +430,7 @@ func parseValuesWithQuotes(valuesStr string) []string {
 				depth--
 			}
 		}
-		
+
 		if !inSingleQuote && !inDoubleQuote && depth == 0 && c == ',' {
 			val := strings.TrimSpace(buf.String())
 			if val == "NULL" {

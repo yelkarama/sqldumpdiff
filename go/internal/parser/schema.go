@@ -18,10 +18,11 @@ type SchemaParser struct {
 
 // NewSchemaParser creates a new schema parser
 func NewSchemaParser() *SchemaParser {
+	// Use simple case-insensitive matching without regex flags since Go's regexp has limited support
 	return &SchemaParser{
-		createTableRegex: regexp.MustCompile(`(?i)CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?` + "`" + `?(\w+)` + "`" + `?`),
-		primaryKeyRegex:  regexp.MustCompile(`(?i)PRIMARY\s+KEY\s*\(\s*` + "`" + `?([^)]+)` + "`" + `?\s*\)`),
-		columnRegex:      regexp.MustCompile("`" + `(\w+)` + "`"),
+		createTableRegex: regexp.MustCompile(`CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?` + "`" + `?([^` + "`" + `\s(]+)` + "`" + `?`),
+		primaryKeyRegex:  regexp.MustCompile(`PRIMARY\s+KEY\s*\(\s*` + "`" + `?([^` + "`" + `)]+)` + "`" + `?\s*\)`),
+		columnRegex:      regexp.MustCompile("`" + "([^`]+)" + "`"),
 	}
 }
 
@@ -47,15 +48,24 @@ func (sp *SchemaParser) ParseSchemas(filename string) (map[string][]string, erro
 	for scanner.Scan() {
 		line := scanner.Text()
 
-		if sp.createTableRegex.MatchString(line) {
-			matches := sp.createTableRegex.FindStringSubmatch(line)
+		if sp.createTableRegex.MatchString(strings.ToUpper(line)) {
+			matches := sp.createTableRegex.FindStringSubmatch(strings.ToUpper(line))
 			if len(matches) > 1 {
-				currentTable = matches[1]
-				inCreateTable = true
-				tableBuffer.Reset()
-				tableBuffer.WriteString(line)
-				tableBuffer.WriteString("\n")
-				logger.Debug("ParseSchemas: Found CREATE TABLE statement for table: %s", currentTable)
+				// Extract table name from original line (preserve case)
+				baseRegex := regexp.MustCompile(`CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?` + "`" + `?([^` + "`" + `\s(]+)` + "`" + `?`)
+				baseMatches := baseRegex.FindStringSubmatch(strings.ToUpper(line))
+				if len(baseMatches) > 1 {
+					// Get the actual case-sensitive table name
+					indexInUpper := strings.Index(strings.ToUpper(line), strings.ToUpper(baseMatches[1]))
+					if indexInUpper >= 0 {
+						currentTable = line[indexInUpper : indexInUpper+len(baseMatches[1])]
+						inCreateTable = true
+						tableBuffer.Reset()
+						tableBuffer.WriteString(line)
+						tableBuffer.WriteString("\n")
+						logger.Debug("ParseSchemas: Found CREATE TABLE statement for table: %s", currentTable)
+					}
+				}
 			}
 		} else if inCreateTable {
 			tableBuffer.WriteString(line)
@@ -66,16 +76,23 @@ func (sp *SchemaParser) ParseSchemas(filename string) (map[string][]string, erro
 			if strings.HasSuffix(trimmedLine, ";") {
 				// End of CREATE TABLE
 				tableDef := tableBuffer.String()
+				tableDefUppercase := strings.ToUpper(tableDef)
 
-				if sp.primaryKeyRegex.MatchString(tableDef) {
-					pkMatches := sp.primaryKeyRegex.FindStringSubmatch(tableDef)
+				if sp.primaryKeyRegex.MatchString(tableDefUppercase) {
+					pkMatches := sp.primaryKeyRegex.FindStringSubmatch(tableDefUppercase)
 					if len(pkMatches) > 1 {
 						pkStr := pkMatches[1]
-						columnMatches := sp.columnRegex.FindAllStringSubmatch(pkStr, -1)
+						// pkStr could be "ID" or "ID,NAME" - split by comma
+						pkParts := strings.Split(pkStr, ",")
 						var pkColumns []string
-						for _, match := range columnMatches {
-							if len(match) > 1 {
-								pkColumns = append(pkColumns, match[1])
+						for _, part := range pkParts {
+							col := strings.TrimSpace(part)
+							// Remove backticks if present
+							col = strings.Trim(col, "`")
+							// Convert to lowercase to match data map keys
+							col = strings.ToLower(col)
+							if col != "" {
+								pkColumns = append(pkColumns, col)
 							}
 						}
 						if len(pkColumns) > 0 {

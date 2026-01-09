@@ -8,29 +8,59 @@ import (
 	"time"
 )
 
+// LogLevel represents logging level
+type LogLevel int
+
+const (
+	InfoLevel LogLevel = iota
+	DebugLevel
+)
+
 // Logger provides structured logging with debug levels
 type Logger struct {
-	debugEnabled bool
-	infoLog      *log.Logger
-	debugLog     *log.Logger
-	errorLog     *log.Logger
+	logLevel int
+	infoLog  *log.Logger
+	debugLog *log.Logger
+	errorLog *log.Logger
 }
 
 var defaultLogger *Logger
 
 // Init initializes the default logger
 func Init(debugEnabled bool) {
-	defaultLogger = New(os.Stderr, debugEnabled)
+	level := InfoLevel
+	if debugEnabled {
+		level = DebugLevel
+	}
+	defaultLogger = NewWithLevel(os.Stderr, level)
 }
 
 // New creates a new logger
 func New(w io.Writer, debugEnabled bool) *Logger {
+	level := InfoLevel
+	if debugEnabled {
+		level = DebugLevel
+	}
+	return NewWithLevel(w, level)
+}
+
+// NewWithLevel creates a new logger with a specific log level
+func NewWithLevel(w io.Writer, level LogLevel) *Logger {
 	flags := log.Ldate | log.Ltime | log.Lshortfile
 	return &Logger{
-		debugEnabled: debugEnabled,
-		infoLog:      log.New(w, "[INFO] ", flags),
-		debugLog:     log.New(w, "[DEBUG] ", flags),
-		errorLog:     log.New(w, "[ERROR] ", flags),
+		logLevel: int(level),
+		infoLog:  log.New(w, "[INFO] ", flags),
+		debugLog: log.New(w, "[DEBUG] ", flags),
+		errorLog: log.New(w, "[ERROR] ", flags),
+	}
+}
+
+// SetLogLevel sets the global log level
+func SetLogLevel(level LogLevel) {
+	if defaultLogger == nil {
+		defaultLogger = NewWithLevel(os.Stderr, level)
+	} else {
+		defaultLogger.logLevel = int(level)
 	}
 }
 
@@ -55,7 +85,7 @@ func Debug(msg string, args ...interface{}) {
 
 // Debug logs a debug message (only shown if debug enabled)
 func (l *Logger) Debug(msg string, args ...interface{}) {
-	if l.debugEnabled {
+	if l.logLevel >= int(DebugLevel) {
 		l.debugLog.Printf(msg, args...)
 	}
 }
@@ -88,7 +118,7 @@ func (l *Logger) Timing(name string, start time.Time) {
 // IsDebugEnabled returns whether debug logging is enabled
 func IsDebugEnabled() bool {
 	if defaultLogger != nil {
-		return defaultLogger.debugEnabled
+		return defaultLogger.logLevel >= int(DebugLevel)
 	}
 	return false
 }

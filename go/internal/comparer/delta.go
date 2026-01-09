@@ -24,9 +24,9 @@ type ComparisonResult struct {
 
 // DeltaGenerator generates delta SQL between two dumps
 type DeltaGenerator struct {
-	pkMap          map[string][]string
-	oldColumnsMap  map[string][]string
-	newColumnsMap  map[string][]string
+	pkMap         map[string][]string
+	oldColumnsMap map[string][]string
+	newColumnsMap map[string][]string
 }
 
 // NewDeltaGenerator creates a new delta generator
@@ -132,7 +132,7 @@ func (dg *DeltaGenerator) compareTable(table string, pkCols []string, oldRows, n
 				for col, oldVal := range updates {
 					changes.WriteString(fmt.Sprintf("-- %s old value: %s\n", col, oldVal))
 				}
-				changes.WriteString(buildUpdateStatement(table, newRow, pkCols))
+				changes.WriteString(buildUpdateStatement(table, newRow, pkCols, updates))
 				changes.WriteString("\n\n")
 				result.UpdateCount++
 			}
@@ -155,11 +155,27 @@ func (dg *DeltaGenerator) compareTable(table string, pkCols []string, oldRows, n
 	return result
 }
 
+func getColumnValueCaseInsensitive(row *parser.InsertRow, colName string) string {
+	// First try exact match
+	if val, exists := row.Data[colName]; exists {
+		return val
+	}
+	// Try case-insensitive match
+	colNameLower := strings.ToLower(colName)
+	for key, val := range row.Data {
+		if strings.ToLower(key) == colNameLower {
+			return val
+		}
+	}
+	return ""
+}
+
 func hashPK(row *parser.InsertRow, pkCols []string) string {
 	var parts []string
 	for _, col := range pkCols {
-		val := row.Data[col]
-		parts = append(parts, val)
+		val := getColumnValueCaseInsensitive(row, col)
+		// Normalize the PK value (strip quotes, handle NULL)
+		parts = append(parts, normalizeNull(val))
 	}
 	data := strings.Join(parts, "|")
 	hash := sha256.Sum256([]byte(data))
@@ -170,8 +186,11 @@ func findUpdates(oldRow, newRow *parser.InsertRow) map[string]string {
 	updates := make(map[string]string)
 	for col, newVal := range newRow.Data {
 		oldVal := oldRow.Data[col]
-		if normalizeNull(oldVal) != normalizeNull(newVal) {
+		oldNorm := normalizeNull(oldVal)
+		newNorm := normalizeNull(newVal)
+		if oldNorm != newNorm {
 			updates[col] = oldVal
+			logger.Debug("findUpdates: Column %s changed: '%s' -> '%s' (normalized: '%s' -> '%s')", col, oldVal, newVal, oldNorm, newNorm)
 		}
 	}
 	return updates
@@ -181,6 +200,15 @@ func normalizeNull(val string) string {
 	if val == "" || strings.ToUpper(val) == "NULL" {
 		return ""
 	}
+
+	// Strip surrounding single quotes (matching Java's behavior)
+	val = strings.TrimSpace(val)
+	if len(val) >= 2 && val[0] == '\'' && val[len(val)-1] == '\'' {
+		val = val[1 : len(val)-1]
+		// Unescape doubled single quotes: '' -> '
+		val = strings.ReplaceAll(val, "''", "'")
+	}
+
 	return val
 }
 
@@ -190,12 +218,7 @@ func buildInsertStatement(row *parser.InsertRow) string {
 
 	for _, col := range row.Columns {
 		cols = append(cols, fmt.Sprintf("`%s`", col))
-		val := row.Data[col]
-		if val == "" {
-			vals = append(vals, "NULL")
-		} else {
-			vals = append(vals, fmt.Sprintf("'%s'", strings.ReplaceAll(val, "'", "''")))
-		}
+		vals = append(vals, formatSQLValue(row.Data[col]))
 	}
 
 	return fmt.Sprintf("INSERT INTO `%s` (%s) VALUES (%s);",
@@ -204,26 +227,11 @@ func buildInsertStatement(row *parser.InsertRow) string {
 		strings.Join(vals, ", "))
 }
 
-func buildUpdateStatement(table string, row *parser.InsertRow, pkCols []string) string {
+func buildUpdateStatement(table string, row *parser.InsertRow, pkCols []string, changedCols map[string]string) string {
 	var setParts []string
-	for _, col := range row.Columns {
-		isPK := false
-		for _, pk := range pkCols {
-			if col == pk {
-				isPK = true
-				break
-			}
-		}
-		if isPK {
-			continue
-		}
-
+	for col := range changedCols {
 		val := row.Data[col]
-		if val == "" {
-			setParts = append(setParts, fmt.Sprintf("`%s`=NULL", col))
-		} else {
-			setParts = append(setParts, fmt.Sprintf("`%s`='%s'", col, strings.ReplaceAll(val, "'", "''")))
-		}
+		setParts = append(setParts, fmt.Sprintf("`%s`=%s", col, formatSQLValue(val)))
 	}
 
 	whereClause := buildWhereClause(row, pkCols)
@@ -243,11 +251,26 @@ func buildWhereClause(row *parser.InsertRow, pkCols []string) string {
 	var parts []string
 	for _, col := range pkCols {
 		val := row.Data[col]
-		if val == "" {
+		normalized := normalizeNull(val)
+		if normalized == "" {
 			parts = append(parts, fmt.Sprintf("`%s` IS NULL", col))
 		} else {
-			parts = append(parts, fmt.Sprintf("`%s`='%s'", col, strings.ReplaceAll(val, "'", "''")))
+			// Re-escape quotes for SQL
+			escaped := strings.ReplaceAll(normalized, "'", "''")
+			parts = append(parts, fmt.Sprintf("`%s`='%s'", col, escaped))
 		}
 	}
 	return strings.Join(parts, " AND ")
+}
+
+// formatSQLValue formats a value for SQL output
+// Handles normalized values (quotes removed) and NULL
+func formatSQLValue(val string) string {
+	normalized := normalizeNull(val)
+	if normalized == "" {
+		return "NULL"
+	}
+	// Escape single quotes for SQL
+	escaped := strings.ReplaceAll(normalized, "'", "''")
+	return fmt.Sprintf("'%s'", escaped)
 }
