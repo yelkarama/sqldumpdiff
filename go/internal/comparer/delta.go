@@ -38,11 +38,11 @@ const sqliteBatchSize = 10000
 
 func applySQLitePragmas(db *sql.DB) error {
 	pragmas := []string{
-		"PRAGMA journal_mode=OFF;",
+		"PRAGMA journal_mode=WAL;",
 		"PRAGMA synchronous=OFF;",
 		"PRAGMA temp_store=MEMORY;",
 		"PRAGMA cache_size=-200000;",
-		"PRAGMA locking_mode=EXCLUSIVE;",
+		"PRAGMA locking_mode=NORMAL;",
 		"PRAGMA busy_timeout=20000;",
 	}
 	for _, pragma := range pragmas {
@@ -55,17 +55,20 @@ func applySQLitePragmas(db *sql.DB) error {
 
 func setupSQLiteSchema(db *sql.DB) error {
 	stmts := []string{
-		`CREATE TABLE IF NOT EXISTS rows (
+		`CREATE TABLE IF NOT EXISTS old_rows (
 			table_name TEXT NOT NULL,
 			pk_hash TEXT NOT NULL,
 			row_json TEXT NOT NULL,
 			PRIMARY KEY (table_name, pk_hash)
 		);`,
-		`CREATE TABLE IF NOT EXISTS seen (
+		`CREATE TABLE IF NOT EXISTS new_rows (
 			table_name TEXT NOT NULL,
 			pk_hash TEXT NOT NULL,
+			row_json TEXT NOT NULL,
 			PRIMARY KEY (table_name, pk_hash)
 		);`,
+		`CREATE INDEX IF NOT EXISTS idx_old_rows_pk ON old_rows(table_name, pk_hash);`,
+		`CREATE INDEX IF NOT EXISTS idx_new_rows_pk ON new_rows(table_name, pk_hash);`,
 	}
 	for _, stmt := range stmts {
 		if _, err := db.Exec(stmt); err != nil {
@@ -75,12 +78,12 @@ func setupSQLiteSchema(db *sql.DB) error {
 	return nil
 }
 
-func beginSQLiteInsert(db *sql.DB) (*sql.Tx, *sql.Stmt, error) {
+func beginSQLiteInsert(db *sql.DB, table string) (*sql.Tx, *sql.Stmt, error) {
 	tx, err := db.Begin()
 	if err != nil {
 		return nil, nil, err
 	}
-	stmt, err := tx.Prepare(`INSERT OR REPLACE INTO rows(table_name, pk_hash, row_json) VALUES(?, ?, ?)`)
+	stmt, err := tx.Prepare(fmt.Sprintf(`INSERT OR REPLACE INTO %s(table_name, pk_hash, row_json) VALUES(?, ?, ?)`, table))
 	if err != nil {
 		_ = tx.Rollback()
 		return nil, nil, err
@@ -88,21 +91,8 @@ func beginSQLiteInsert(db *sql.DB) (*sql.Tx, *sql.Stmt, error) {
 	return tx, stmt, nil
 }
 
-func beginSQLiteSeenInsert(db *sql.DB) (*sql.Tx, *sql.Stmt, error) {
-	tx, err := db.Begin()
-	if err != nil {
-		return nil, nil, err
-	}
-	stmt, err := tx.Prepare(`INSERT OR IGNORE INTO seen(table_name, pk_hash) VALUES(?, ?)`)
-	if err != nil {
-		_ = tx.Rollback()
-		return nil, nil, err
-	}
-	return tx, stmt, nil
-}
-
-func insertRowsToSQLite(db *sql.DB, insertParser *parser.InsertParser, filename string, columns map[string][]string, pkMap map[string][]string, p *mpb.Progress) error {
-	tx, stmt, err := beginSQLiteInsert(db)
+func insertRowsToSQLite(db *sql.DB, table string, insertParser *parser.InsertParser, filename string, columns map[string][]string, pkMap map[string][]string, p *mpb.Progress) error {
+	tx, stmt, err := beginSQLiteInsert(db, table)
 	if err != nil {
 		return fmt.Errorf("begin insert: %w", err)
 	}
@@ -137,12 +127,12 @@ func insertRowsToSQLite(db *sql.DB, insertParser *parser.InsertParser, filename 
 				}
 				if e := tx.Commit(); e != nil && firstErr == nil {
 					firstErr = e
-					return
-				}
-				nextTx, nextStmt, nextErr := beginSQLiteInsert(db)
-				if nextErr != nil {
-					firstErr = nextErr
-					return
+				return
+			}
+			nextTx, nextStmt, nextErr := beginSQLiteInsert(db, table)
+			if nextErr != nil {
+				firstErr = nextErr
+				return
 				}
 				tx = nextTx
 				stmt = nextStmt
@@ -167,117 +157,206 @@ func insertRowsToSQLite(db *sql.DB, insertParser *parser.InsertParser, filename 
 	return nil
 }
 
-func compareSQLiteDBs(dbOld, dbNew, dbSeen *sql.DB, pkMap map[string][]string, out io.Writer, summary *Summary) error {
-	getStmt, err := dbOld.Prepare(`SELECT row_json FROM rows WHERE table_name = ? AND pk_hash = ?`)
-	if err != nil {
-		return fmt.Errorf("prepare lookup: %w", err)
-	}
-	defer getStmt.Close()
+type rowItem struct {
+	tableName string
+	pkHash    string
+	rowJSON   string
+	destTable string
+}
 
-	tx, seenStmt, err := beginSQLiteSeenInsert(dbSeen)
-	if err != nil {
-		return fmt.Errorf("begin seen insert: %w", err)
-	}
-	defer seenStmt.Close()
+func ingestParallelToSQLite(db *sql.DB, insertParser *parser.InsertParser, oldFile, newFile string, oldCols, newCols map[string][]string, pkMap map[string][]string, p *mpb.Progress) error {
+	items := make(chan rowItem, 4096)
+	errCh := make(chan error, 2)
 
-	rows, err := dbNew.Query(`SELECT table_name, pk_hash, row_json FROM rows`)
+	parseFile := func(filename string, columns map[string][]string, destTable string) {
+		err := insertParser.ParseInsertsStream(filename, columns, p, func(row *parser.InsertRow) {
+			pkCols, hasPK := pkMap[row.Table]
+			if !hasPK {
+				return
+			}
+			hash := hashPK(row, pkCols)
+			val, mErr := json.Marshal(row)
+			if mErr != nil {
+				errCh <- mErr
+				return
+			}
+			items <- rowItem{
+				tableName: row.Table,
+				pkHash:    hash,
+				rowJSON:   string(val),
+				destTable: destTable,
+			}
+		})
+		errCh <- err
+	}
+
+	go parseFile(oldFile, oldCols, "old_rows")
+	go parseFile(newFile, newCols, "new_rows")
+
+	tx, oldStmt, err := beginSQLiteInsert(db, "old_rows")
 	if err != nil {
-		return fmt.Errorf("scan new rows: %w", err)
+		return fmt.Errorf("begin insert old: %w", err)
+	}
+	newTx := tx
+	newStmt := oldStmt
+	if oldStmt != nil {
+		// reuse tx but different stmt for new_rows
+		newStmt, err = tx.Prepare(`INSERT OR REPLACE INTO new_rows(table_name, pk_hash, row_json) VALUES(?, ?, ?)`)
+		if err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("prepare insert new: %w", err)
+		}
+	}
+
+	defer oldStmt.Close()
+	defer newStmt.Close()
+
+	doneParsers := 0
+	batchCount := 0
+	for doneParsers < 2 {
+		select {
+		case err := <-errCh:
+			if err != nil {
+				_ = tx.Rollback()
+				return err
+			}
+			doneParsers++
+		case item := <-items:
+			stmt := oldStmt
+			if item.destTable == "new_rows" {
+				stmt = newStmt
+			}
+			if _, e := stmt.Exec(item.tableName, item.pkHash, item.rowJSON); e != nil {
+				_ = tx.Rollback()
+				return fmt.Errorf("insert rows: %w", e)
+			}
+			batchCount++
+			if batchCount >= sqliteBatchSize {
+				if err := oldStmt.Close(); err != nil {
+					_ = tx.Rollback()
+					return fmt.Errorf("close stmt: %w", err)
+				}
+				if err := newStmt.Close(); err != nil {
+					_ = tx.Rollback()
+					return fmt.Errorf("close stmt: %w", err)
+				}
+				if err := tx.Commit(); err != nil {
+					return fmt.Errorf("commit insert: %w", err)
+				}
+				tx, oldStmt, err = beginSQLiteInsert(db, "old_rows")
+				if err != nil {
+					return fmt.Errorf("begin insert old: %w", err)
+				}
+				newTx = tx
+				_ = newTx
+				newStmt, err = tx.Prepare(`INSERT OR REPLACE INTO new_rows(table_name, pk_hash, row_json) VALUES(?, ?, ?)`)
+				if err != nil {
+					_ = tx.Rollback()
+					return fmt.Errorf("prepare insert new: %w", err)
+				}
+				batchCount = 0
+			}
+		}
+	}
+
+	// drain any remaining items
+	for {
+		select {
+		case item := <-items:
+			stmt := oldStmt
+			if item.destTable == "new_rows" {
+				stmt = newStmt
+			}
+			if _, e := stmt.Exec(item.tableName, item.pkHash, item.rowJSON); e != nil {
+				_ = tx.Rollback()
+				return fmt.Errorf("insert rows: %w", e)
+			}
+		default:
+			goto done
+		}
+	}
+done:
+	if err := oldStmt.Close(); err != nil {
+		_ = tx.Rollback()
+		return fmt.Errorf("close stmt: %w", err)
+	}
+	if err := newStmt.Close(); err != nil {
+		_ = tx.Rollback()
+		return fmt.Errorf("close stmt: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit insert: %w", err)
+	}
+	return nil
+}
+
+func compareSQLiteTables(db *sql.DB, pkMap map[string][]string, out io.Writer, summary *Summary) error {
+	rows, err := db.Query(`
+		SELECT n.table_name, n.pk_hash, n.row_json, o.row_json
+		FROM new_rows n
+		LEFT JOIN old_rows o
+		ON o.table_name = n.table_name AND o.pk_hash = n.pk_hash
+	`)
+	if err != nil {
+		return fmt.Errorf("compare query: %w", err)
 	}
 	defer rows.Close()
 
-	batchCount := 0
 	for rows.Next() {
-		var table, hash, rowStr string
-		if err := rows.Scan(&table, &hash, &rowStr); err != nil {
-			_ = tx.Rollback()
-			return fmt.Errorf("scan new row: %w", err)
+		var table, hash, newRowStr string
+		var oldRowStr sql.NullString
+		if err := rows.Scan(&table, &hash, &newRowStr, &oldRowStr); err != nil {
+			return fmt.Errorf("scan compare: %w", err)
 		}
 		pkCols, hasPK := pkMap[table]
 		if !hasPK {
 			continue
 		}
 		var newRow parser.InsertRow
-		if err := json.Unmarshal([]byte(rowStr), &newRow); err != nil {
-			_ = tx.Rollback()
+		if err := json.Unmarshal([]byte(newRowStr), &newRow); err != nil {
 			return fmt.Errorf("decode new row: %w", err)
 		}
 
-		var oldRow parser.InsertRow
-		oldStr := ""
-		scanErr := getStmt.QueryRow(table, hash).Scan(&oldStr)
-		if scanErr == sql.ErrNoRows {
+		if !oldRowStr.Valid {
 			fmt.Fprintf(out, "-- NEW RECORD IN %s\n", table)
 			fmt.Fprint(out, buildInsertStatement(&newRow))
 			fmt.Fprint(out, "\n\n")
 			summary.InsertCount++
-		} else if scanErr != nil {
-			_ = tx.Rollback()
-			return fmt.Errorf("lookup old row: %w", scanErr)
-		} else {
-			if err := json.Unmarshal([]byte(oldStr), &oldRow); err != nil {
-				_ = tx.Rollback()
-				return fmt.Errorf("decode old row: %w", err)
-			}
-			updates := findUpdates(&oldRow, &newRow)
-			if len(updates) > 0 {
-				for col, oldVal := range updates {
-					fmt.Fprintf(out, "-- %s old value: %s\n", col, oldVal)
-				}
-				fmt.Fprint(out, buildUpdateStatement(table, &newRow, pkCols, updates))
-				fmt.Fprint(out, "\n\n")
-				summary.UpdateCount++
-			}
+			continue
 		}
 
-		if _, e := seenStmt.Exec(table, hash); e != nil {
-			_ = tx.Rollback()
-			return fmt.Errorf("insert seen: %w", e)
+		var oldRow parser.InsertRow
+		if err := json.Unmarshal([]byte(oldRowStr.String), &oldRow); err != nil {
+			return fmt.Errorf("decode old row: %w", err)
 		}
-		batchCount++
-		if batchCount >= sqliteBatchSize {
-			if e := seenStmt.Close(); e != nil {
-				_ = tx.Rollback()
-				return fmt.Errorf("close seen stmt: %w", e)
+		updates := findUpdates(&oldRow, &newRow)
+		if len(updates) > 0 {
+			for col, oldVal := range updates {
+				fmt.Fprintf(out, "-- %s old value: %s\n", col, oldVal)
 			}
-			if e := tx.Commit(); e != nil {
-				return fmt.Errorf("commit seen: %w", e)
-			}
-			nextTx, nextStmt, nextErr := beginSQLiteSeenInsert(dbSeen)
-			if nextErr != nil {
-				return fmt.Errorf("begin seen insert: %w", nextErr)
-			}
-			tx = nextTx
-			seenStmt = nextStmt
-			batchCount = 0
+			fmt.Fprint(out, buildUpdateStatement(table, &newRow, pkCols, updates))
+			fmt.Fprint(out, "\n\n")
+			summary.UpdateCount++
 		}
 	}
 	if err := rows.Err(); err != nil {
-		_ = tx.Rollback()
-		return fmt.Errorf("iterate new rows: %w", err)
-	}
-	if err := seenStmt.Close(); err != nil {
-		_ = tx.Rollback()
-		return fmt.Errorf("close seen stmt: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit seen: %w", err)
+		return fmt.Errorf("iterate compare rows: %w", err)
 	}
 	return nil
 }
 
-func emitDeletions(dbOld, dbSeen *sql.DB, pkMap map[string][]string, out io.Writer, summary *Summary) error {
-	rows, err := dbOld.Query(`SELECT table_name, pk_hash, row_json FROM rows`)
+func emitDeletionsSQL(db *sql.DB, pkMap map[string][]string, out io.Writer, summary *Summary) error {
+	rows, err := db.Query(`
+		SELECT o.table_name, o.pk_hash, o.row_json
+		FROM old_rows o
+		LEFT JOIN new_rows n
+		ON n.table_name = o.table_name AND n.pk_hash = o.pk_hash
+		WHERE n.pk_hash IS NULL
+	`)
 	if err != nil {
 		return fmt.Errorf("query deletions: %w", err)
 	}
 	defer rows.Close()
-
-	seenStmt, err := dbSeen.Prepare(`SELECT 1 FROM seen WHERE table_name = ? AND pk_hash = ?`)
-	if err != nil {
-		return fmt.Errorf("prepare seen lookup: %w", err)
-	}
-	defer seenStmt.Close()
 
 	for rows.Next() {
 		var table, hash, rowStr string
@@ -288,13 +367,6 @@ func emitDeletions(dbOld, dbSeen *sql.DB, pkMap map[string][]string, out io.Writ
 		if !hasPK {
 			continue
 		}
-		var exists int
-		if err := seenStmt.QueryRow(table, hash).Scan(&exists); err == nil {
-			continue
-		} else if err != sql.ErrNoRows {
-			return fmt.Errorf("lookup seen: %w", err)
-		}
-
 		var oldRow parser.InsertRow
 		if err := json.Unmarshal([]byte(rowStr), &oldRow); err != nil {
 			return fmt.Errorf("decode deletion row: %w", err)
@@ -336,47 +408,16 @@ func (dg *DeltaGenerator) GenerateDelta(oldFile, newFile string, p *mpb.Progress
 	}
 	defer os.RemoveAll(tmpDir)
 
-	oldPath := tmpDir + string(os.PathSeparator) + "old.db"
-	newPath := tmpDir + string(os.PathSeparator) + "new.db"
-	seenPath := tmpDir + string(os.PathSeparator) + "seen.db"
-
-	dbOld, err := sql.Open("sqlite", oldPath)
+	dbPath := tmpDir + string(os.PathSeparator) + "sqldumpdiff.db"
+	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		return Summary{}, fmt.Errorf("open sqlite: %w", err)
 	}
-	defer dbOld.Close()
-	dbOld.SetMaxOpenConns(1)
-
-	dbNew, err := sql.Open("sqlite", newPath)
-	if err != nil {
-		return Summary{}, fmt.Errorf("open sqlite (new): %w", err)
-	}
-	defer dbNew.Close()
-	dbNew.SetMaxOpenConns(1)
-
-	dbSeen, err := sql.Open("sqlite", seenPath)
-	if err != nil {
-		return Summary{}, fmt.Errorf("open sqlite (seen): %w", err)
-	}
-	defer dbSeen.Close()
-	dbSeen.SetMaxOpenConns(1)
-
-	if err := applySQLitePragmas(dbOld); err != nil {
+	defer db.Close()
+	if err := applySQLitePragmas(db); err != nil {
 		return Summary{}, err
 	}
-	if err := applySQLitePragmas(dbNew); err != nil {
-		return Summary{}, err
-	}
-	if err := applySQLitePragmas(dbSeen); err != nil {
-		return Summary{}, err
-	}
-	if err := setupSQLiteSchema(dbOld); err != nil {
-		return Summary{}, err
-	}
-	if err := setupSQLiteSchema(dbNew); err != nil {
-		return Summary{}, err
-	}
-	if err := setupSQLiteSchema(dbSeen); err != nil {
+	if err := setupSQLiteSchema(db); err != nil {
 		return Summary{}, err
 	}
 
@@ -387,33 +428,22 @@ func (dg *DeltaGenerator) GenerateDelta(oldFile, newFile string, p *mpb.Progress
 	fmt.Fprintln(out, "SET FOREIGN_KEY_CHECKS = 0;")
 	fmt.Fprintln(out)
 
-	// Index old/new rows in parallel
-	logger.Debug("GenerateDelta: Indexing old/new files in parallel")
-	oldCh := make(chan error, 1)
-	newCh := make(chan error, 1)
-	go func() {
-		oldCh <- insertRowsToSQLite(dbOld, insertParser, oldFile, dg.oldColumnsMap, dg.pkMap, p)
-	}()
-	go func() {
-		newCh <- insertRowsToSQLite(dbNew, insertParser, newFile, dg.newColumnsMap, dg.pkMap, p)
-	}()
-	if err := <-oldCh; err != nil {
-		return Summary{}, err
-	}
-	if err := <-newCh; err != nil {
+	// Index old/new rows in parallel parsing, single writer to avoid SQLITE_BUSY
+	logger.Debug("GenerateDelta: Indexing old/new files (parallel parse, single writer)")
+	if err := ingestParallelToSQLite(db, insertParser, oldFile, newFile, dg.oldColumnsMap, dg.newColumnsMap, dg.pkMap, p); err != nil {
 		return Summary{}, err
 	}
 
-	// Compare using new DB and old DB
+	// Compare using set-based joins
 	logger.Debug("GenerateDelta: Comparing rows")
-	if err := compareSQLiteDBs(dbOld, dbNew, dbSeen, dg.pkMap, out, &summary); err != nil {
+	if err := compareSQLiteTables(db, dg.pkMap, out, &summary); err != nil {
 		return Summary{}, err
 	}
 
 	// Emit deletions
 	logger.Debug("GenerateDelta: Scanning for deletions")
 	fmt.Fprintln(out, "-- DELETIONS")
-	if err := emitDeletions(dbOld, dbSeen, dg.pkMap, out, &summary); err != nil {
+	if err := emitDeletionsSQL(db, dg.pkMap, out, &summary); err != nil {
 		return Summary{}, err
 	}
 
