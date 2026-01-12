@@ -118,32 +118,29 @@ func main() {
 
 	// Generate delta
 	dg := comparer.NewDeltaGenerator(oldPKMap, oldColsMap, newColsMap)
-	results, err := dg.GenerateDelta(oldFile, newFile, p)
+	var out *os.File
+	if deltaFile != "" {
+		file, err := os.Create(deltaFile)
+		if err != nil {
+			log.Fatalf("Error creating delta file: %v", err)
+		}
+		defer file.Close()
+		out = file
+	} else {
+		out = os.Stdout
+	}
+
+	summary, err := dg.GenerateDelta(oldFile, newFile, p, out)
 	if err != nil {
 		log.Fatalf("Error generating delta: %v", err)
 	}
 
 	// Print summary
-	totalInserts := 0
-	totalUpdates := 0
-	totalDeletes := 0
-
-	for _, result := range results {
-		totalInserts += result.InsertCount
-		totalUpdates += result.UpdateCount
-		totalDeletes += result.DeleteCount
-	}
-
 	fmt.Printf("Summary:\n")
-	fmt.Printf("  Inserts: %d\n", totalInserts)
-	fmt.Printf("  Updates: %d\n", totalUpdates)
-	fmt.Printf("  Deletes: %d\n", totalDeletes)
-	fmt.Printf("  Total:   %d\n", totalInserts+totalUpdates+totalDeletes)
-
-	// Write delta script
-	if err := comparer.WriteDeltaScript(results, deltaFile, p); err != nil {
-		log.Fatalf("Error writing delta script: %v", err)
-	}
+	fmt.Printf("  Inserts: %d\n", summary.InsertCount)
+	fmt.Printf("  Updates: %d\n", summary.UpdateCount)
+	fmt.Printf("  Deletes: %d\n", summary.DeleteCount)
+	fmt.Printf("  Total:   %d\n", summary.InsertCount+summary.UpdateCount+summary.DeleteCount)
 
 	// Ensure progress bars are fully rendered before exit
 	p.Wait()

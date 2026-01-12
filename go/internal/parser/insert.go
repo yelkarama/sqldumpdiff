@@ -118,6 +118,94 @@ func (acc *InsertAccumulator) Finalize() []string {
 	return results
 }
 
+// ParseInsertsStream reads INSERT statements from a file and calls onRow for each row.
+func (ip *InsertParser) ParseInsertsStream(filename string, columns map[string][]string, p *mpb.Progress, onRow func(*InsertRow)) error {
+	logger.Debug("ParseInsertsStream: Opening file %s", filename)
+	file, err := os.Open(filename)
+	if err != nil {
+		logger.Error("ParseInsertsStream: Failed to open file %s: %v", filename, err)
+		return err
+	}
+	defer file.Close()
+
+	// Get file size for progress bar
+	fi, err := file.Stat()
+	if err != nil {
+		logger.Error("ParseInsertsStream: Failed to stat file: %v", err)
+		return err
+	}
+	fileSize := fi.Size()
+	logger.Debug("ParseInsertsStream: File size: %d bytes", fileSize)
+
+	var bar *mpb.Bar
+	if p != nil {
+		bar = p.New(
+			fileSize,
+			mpb.BarStyle().Lbound("[").Filler("█").Tip("█").Padding(" ").Rbound("]"),
+			mpb.PrependDecorators(
+				decor.Name(fmt.Sprintf("Parsing %s", filepath.Base(filename)), decor.WC{W: 20, C: decor.DindentRight | decor.DextraSpace}),
+				decor.CountersKibiByte("% .2f / % .2f", decor.WC{W: 18, C: decor.DindentRight | decor.DextraSpace}),
+			),
+			mpb.AppendDecorators(
+				decor.Percentage(decor.WC{W: 5}),
+			),
+		)
+	}
+
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024) // 16MB buffer for large lines
+
+	acc := &InsertAccumulator{}
+	bytesRead := int64(0)
+	for scanner.Scan() {
+		line := scanner.Text()
+		lineSize := int64(len(line)) + 1
+		bytesRead += lineSize
+		if bar != nil {
+			bar.IncrBy(int(lineSize))
+		}
+
+		// Process the line and get any complete INSERT statements
+		statements := acc.ProcessLine(line)
+		for _, stmt := range statements {
+			rows, err := ip.ExpandInsert(stmt, columns)
+			if err != nil {
+				logger.Debug("ParseInsertsStream: Failed to expand INSERT statement: %v", err)
+				continue
+			}
+
+			for _, row := range rows {
+				onRow(row)
+			}
+		}
+	}
+
+	// Handle any incomplete statement at EOF
+	statements := acc.Finalize()
+	for _, stmt := range statements {
+		rows, err := ip.ExpandInsert(stmt, columns)
+		if err != nil {
+			logger.Debug("ParseInsertsStream: Failed to expand INSERT statement: %v", err)
+			continue
+		}
+
+		for _, row := range rows {
+			onRow(row)
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		logger.Error("ParseInsertsStream: Scanner error: %v", err)
+		return err
+	}
+	if bar != nil {
+		bar.SetTotal(bytesRead, true)
+	}
+
+	logger.Debug("ParseInsertsStream: Processed %d INSERT statements", acc.statementsProcessed)
+	return nil
+}
+
 // ParseInserts reads INSERT statements from a file with progress reporting
 func (ip *InsertParser) ParseInserts(filename string, columns map[string][]string, p *mpb.Progress) (map[string][]*InsertRow, error) {
 	logger.Debug("ParseInserts: Opening file %s", filename)
