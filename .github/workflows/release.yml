@@ -65,16 +65,9 @@ jobs:
           set -euo pipefail
           cd go
           OUT="sqldumpdiff-${{ matrix.os }}-${{ matrix.arch }}"
-          if [[ "${{ matrix.os }}" == "windows" ]]; then
-            OUT="${OUT}.exe"
-          fi
           GOOS="${{ matrix.os }}" GOARCH="${{ matrix.arch }}" go build -o "$OUT" ./cmd/sqldumpdiff
           mkdir -p dist
-          if [[ "${{ matrix.os }}" == "windows" ]]; then
-            zip -j "dist/${OUT}.zip" "$OUT"
-          else
-            tar -C . -czf "dist/${OUT}.tar.gz" "$OUT"
-          fi
+          cp "$OUT" "dist/${OUT}"
       - name: Build (windows)
         if: matrix.os == 'windows'
         shell: msys2 {0}
@@ -85,12 +78,6 @@ jobs:
           GOOS="${{ matrix.os }}" GOARCH="${{ matrix.arch }}" go build -o "$OUT" ./cmd/sqldumpdiff
           mkdir -p dist
           cp "$OUT" "dist/${OUT}"
-      - name: Zip (windows)
-        if: matrix.os == 'windows'
-        shell: pwsh
-        run: |
-          $out = "sqldumpdiff-${{ matrix.os }}-${{ matrix.arch }}.exe"
-          Compress-Archive -Path "go/dist/$out" -DestinationPath "go/dist/$out.zip" -Force
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -134,12 +121,11 @@ jobs:
           mvn -q -Pnative -DskipTests package
           mkdir -p dist
           cp target/sqldumpdiff dist/sqldumpdiff-linux-native
-          tar -C dist -czf dist/sqldumpdiff-linux-native.tar.gz sqldumpdiff-linux-native
       - name: Upload native artifact (linux)
         uses: actions/upload-artifact@v4
         with:
           name: java-native-linux
-          path: java/dist/sqldumpdiff-linux-native.tar.gz
+          path: java/dist/sqldumpdiff-linux-native
 
   java-native-windows:
     name: Java Native (windows)
@@ -158,13 +144,11 @@ jobs:
           mvn -q -Pnative -DskipTests package
           mkdir -p dist
           cp target/sqldumpdiff.exe dist/sqldumpdiff-windows-native.exe
-          cd dist
-          zip sqldumpdiff-windows-native.zip sqldumpdiff-windows-native.exe
       - name: Upload native artifact (windows)
         uses: actions/upload-artifact@v4
         with:
           name: java-native-windows
-          path: java/dist/sqldumpdiff-windows-native.zip
+          path: java/dist/sqldumpdiff-windows-native.exe
 
   release:
     name: Publish Release
@@ -177,6 +161,12 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      - name: Generate SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum * > SHA256SUMS.txt
       - name: Create/Update nightly tag
         uses: actions/github-script@v7
         with:
