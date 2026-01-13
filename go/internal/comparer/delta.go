@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"strings"
 
 	_ "modernc.org/sqlite"
@@ -36,6 +37,23 @@ type Summary struct {
 
 const sqliteBatchSize = 10000
 
+func rowHash(row *parser.InsertRow) []byte {
+	keys := make([]string, 0, len(row.Data))
+	for k := range row.Data {
+		keys = append(keys, strings.ToLower(k))
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	for _, k := range keys {
+		b.WriteString(k)
+		b.WriteString("=")
+		b.WriteString(normalizeNull(row.Data[k]))
+		b.WriteString(";")
+	}
+	sum := sha256.Sum256([]byte(b.String()))
+	return sum[:]
+}
+
 func applySQLitePragmas(db *sql.DB) error {
 	pragmas := []string{
 		"PRAGMA journal_mode=WAL;",
@@ -58,12 +76,14 @@ func setupSQLiteSchema(db *sql.DB) error {
 		`CREATE TABLE IF NOT EXISTS old_rows (
 			table_name TEXT NOT NULL,
 			pk_hash TEXT NOT NULL,
+			row_hash BLOB NOT NULL,
 			row_json TEXT NOT NULL,
 			PRIMARY KEY (table_name, pk_hash)
 		);`,
 		`CREATE TABLE IF NOT EXISTS new_rows (
 			table_name TEXT NOT NULL,
 			pk_hash TEXT NOT NULL,
+			row_hash BLOB NOT NULL,
 			row_json TEXT NOT NULL,
 			PRIMARY KEY (table_name, pk_hash)
 		);`,
@@ -83,7 +103,7 @@ func beginSQLiteInsert(db *sql.DB, table string) (*sql.Tx, *sql.Stmt, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	stmt, err := tx.Prepare(fmt.Sprintf(`INSERT OR REPLACE INTO %s(table_name, pk_hash, row_json) VALUES(?, ?, ?)`, table))
+	stmt, err := tx.Prepare(fmt.Sprintf(`INSERT OR REPLACE INTO %s(table_name, pk_hash, row_hash, row_json) VALUES(?, ?, ?, ?)`, table))
 	if err != nil {
 		_ = tx.Rollback()
 		return nil, nil, err
@@ -115,7 +135,8 @@ func insertRowsToSQLite(db *sql.DB, table string, insertParser *parser.InsertPar
 			firstErr = mErr
 			return
 		}
-		if _, e := stmt.Exec(row.Table, hash, string(val)); e != nil {
+		rh := rowHash(row)
+		if _, e := stmt.Exec(row.Table, hash, rh, string(val)); e != nil {
 			firstErr = e
 			return
 		}
@@ -160,6 +181,7 @@ func insertRowsToSQLite(db *sql.DB, table string, insertParser *parser.InsertPar
 type rowItem struct {
 	tableName string
 	pkHash    string
+	rowHash   []byte
 	rowJSON   string
 	destTable string
 }
@@ -180,9 +202,11 @@ func ingestParallelToSQLite(db *sql.DB, insertParser *parser.InsertParser, oldFi
 				errCh <- mErr
 				return
 			}
+			rh := rowHash(row)
 			items <- rowItem{
 				tableName: row.Table,
 				pkHash:    hash,
+				rowHash:   rh,
 				rowJSON:   string(val),
 				destTable: destTable,
 			}
@@ -201,7 +225,7 @@ func ingestParallelToSQLite(db *sql.DB, insertParser *parser.InsertParser, oldFi
 	newStmt := oldStmt
 	if oldStmt != nil {
 		// reuse tx but different stmt for new_rows
-		newStmt, err = tx.Prepare(`INSERT OR REPLACE INTO new_rows(table_name, pk_hash, row_json) VALUES(?, ?, ?)`)
+		newStmt, err = tx.Prepare(`INSERT OR REPLACE INTO new_rows(table_name, pk_hash, row_hash, row_json) VALUES(?, ?, ?, ?)`)
 		if err != nil {
 			_ = tx.Rollback()
 			return fmt.Errorf("prepare insert new: %w", err)
@@ -226,7 +250,7 @@ func ingestParallelToSQLite(db *sql.DB, insertParser *parser.InsertParser, oldFi
 			if item.destTable == "new_rows" {
 				stmt = newStmt
 			}
-			if _, e := stmt.Exec(item.tableName, item.pkHash, item.rowJSON); e != nil {
+			if _, e := stmt.Exec(item.tableName, item.pkHash, item.rowHash, item.rowJSON); e != nil {
 				_ = tx.Rollback()
 				return fmt.Errorf("insert rows: %w", e)
 			}
@@ -249,7 +273,7 @@ func ingestParallelToSQLite(db *sql.DB, insertParser *parser.InsertParser, oldFi
 				}
 				newTx = tx
 				_ = newTx
-				newStmt, err = tx.Prepare(`INSERT OR REPLACE INTO new_rows(table_name, pk_hash, row_json) VALUES(?, ?, ?)`)
+				newStmt, err = tx.Prepare(`INSERT OR REPLACE INTO new_rows(table_name, pk_hash, row_hash, row_json) VALUES(?, ?, ?, ?)`)
 				if err != nil {
 					_ = tx.Rollback()
 					return fmt.Errorf("prepare insert new: %w", err)
@@ -267,7 +291,7 @@ func ingestParallelToSQLite(db *sql.DB, insertParser *parser.InsertParser, oldFi
 			if item.destTable == "new_rows" {
 				stmt = newStmt
 			}
-			if _, e := stmt.Exec(item.tableName, item.pkHash, item.rowJSON); e != nil {
+			if _, e := stmt.Exec(item.tableName, item.pkHash, item.rowHash, item.rowJSON); e != nil {
 				_ = tx.Rollback()
 				return fmt.Errorf("insert rows: %w", e)
 			}
@@ -291,22 +315,60 @@ done:
 }
 
 func compareSQLiteTables(db *sql.DB, pkMap map[string][]string, out io.Writer, summary *Summary) error {
-	rows, err := db.Query(`
-		SELECT n.table_name, n.pk_hash, n.row_json, o.row_json
+	// Inserts
+	insRows, err := db.Query(`
+		SELECT n.table_name, n.pk_hash, n.row_json
 		FROM new_rows n
 		LEFT JOIN old_rows o
 		ON o.table_name = n.table_name AND o.pk_hash = n.pk_hash
+		WHERE o.pk_hash IS NULL
 	`)
 	if err != nil {
-		return fmt.Errorf("compare query: %w", err)
+		return fmt.Errorf("insert query: %w", err)
 	}
-	defer rows.Close()
-
-	for rows.Next() {
+	for insRows.Next() {
 		var table, hash, newRowStr string
-		var oldRowStr sql.NullString
-		if err := rows.Scan(&table, &hash, &newRowStr, &oldRowStr); err != nil {
-			return fmt.Errorf("scan compare: %w", err)
+		if err := insRows.Scan(&table, &hash, &newRowStr); err != nil {
+			insRows.Close()
+			return fmt.Errorf("scan insert: %w", err)
+		}
+		_, hasPK := pkMap[table]
+		if !hasPK {
+			continue
+		}
+		var newRow parser.InsertRow
+		if err := json.Unmarshal([]byte(newRowStr), &newRow); err != nil {
+			insRows.Close()
+			return fmt.Errorf("decode insert row: %w", err)
+		}
+		fmt.Fprintf(out, "-- NEW RECORD IN %s\n", table)
+		fmt.Fprint(out, buildInsertStatement(&newRow))
+		fmt.Fprint(out, "\n\n")
+		summary.InsertCount++
+	}
+	if err := insRows.Err(); err != nil {
+		insRows.Close()
+		return fmt.Errorf("iterate inserts: %w", err)
+	}
+	insRows.Close()
+
+	// Updates (hash diff)
+	upRows, err := db.Query(`
+		SELECT n.table_name, n.pk_hash, n.row_json, o.row_json
+		FROM new_rows n
+		JOIN old_rows o
+		ON o.table_name = n.table_name AND o.pk_hash = n.pk_hash
+		WHERE n.row_hash <> o.row_hash
+	`)
+	if err != nil {
+		return fmt.Errorf("update query: %w", err)
+	}
+	defer upRows.Close()
+
+	for upRows.Next() {
+		var table, hash, newRowStr, oldRowStr string
+		if err := upRows.Scan(&table, &hash, &newRowStr, &oldRowStr); err != nil {
+			return fmt.Errorf("scan update: %w", err)
 		}
 		pkCols, hasPK := pkMap[table]
 		if !hasPK {
@@ -316,17 +378,8 @@ func compareSQLiteTables(db *sql.DB, pkMap map[string][]string, out io.Writer, s
 		if err := json.Unmarshal([]byte(newRowStr), &newRow); err != nil {
 			return fmt.Errorf("decode new row: %w", err)
 		}
-
-		if !oldRowStr.Valid {
-			fmt.Fprintf(out, "-- NEW RECORD IN %s\n", table)
-			fmt.Fprint(out, buildInsertStatement(&newRow))
-			fmt.Fprint(out, "\n\n")
-			summary.InsertCount++
-			continue
-		}
-
 		var oldRow parser.InsertRow
-		if err := json.Unmarshal([]byte(oldRowStr.String), &oldRow); err != nil {
+		if err := json.Unmarshal([]byte(oldRowStr), &oldRow); err != nil {
 			return fmt.Errorf("decode old row: %w", err)
 		}
 		updates := findUpdates(&oldRow, &newRow)
@@ -338,9 +391,10 @@ func compareSQLiteTables(db *sql.DB, pkMap map[string][]string, out io.Writer, s
 			fmt.Fprint(out, "\n\n")
 			summary.UpdateCount++
 		}
+		_ = hash
 	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("iterate compare rows: %w", err)
+	if err := upRows.Err(); err != nil {
+		return fmt.Errorf("iterate updates: %w", err)
 	}
 	return nil
 }
