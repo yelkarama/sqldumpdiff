@@ -14,10 +14,14 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// sqliteProfilesFile is the on-disk YAML shape for performance presets.
+// It keeps the CLI defaults out of code so we can tweak them without recompiling.
 type sqliteProfilesFile struct {
 	Profiles map[string]sqliteProfile `yaml:"profiles"`
 }
 
+// sqliteProfile represents one preset for SQLite tuning.
+// These map directly onto the runtime knobs used by the comparer package.
 type sqliteProfile struct {
 	CacheKB int `yaml:"cache_kb"`
 	MmapMB  int `yaml:"mmap_mb"`
@@ -25,6 +29,9 @@ type sqliteProfile struct {
 	Workers int `yaml:"workers"`
 }
 
+// loadSQLiteProfiles reads the YAML file and returns the profile map.
+// We keep YAML parsing here (CLI layer) instead of in comparer to keep that
+// package focused on diff logic.
 func loadSQLiteProfiles(path string) (map[string]sqliteProfile, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -40,6 +47,7 @@ func loadSQLiteProfiles(path string) (map[string]sqliteProfile, error) {
 	return cfg.Profiles, nil
 }
 
+// profileKeys returns a stable list of profile names for error messages.
 func profileKeys(m map[string]sqliteProfile) []string {
 	keys := make([]string, 0, len(m))
 	for k := range m {
@@ -49,7 +57,9 @@ func profileKeys(m map[string]sqliteProfile) []string {
 }
 
 func main() {
-	// Parse command line arguments
+	// Parse command line arguments.
+	// Each flag maps to a specific runtime tuning knob, and users can override
+	// the YAML profile defaults at the command line.
 	debug := flag.Bool("debug", false, "Enable debug logging")
 	sqliteCacheKB := flag.Int("sqlite-cache-kb", 800000, "SQLite cache size in KB (negative means KB)")
 	sqliteMmapMB := flag.Int("sqlite-mmap-mb", 128, "SQLite mmap size in MB")
@@ -59,13 +69,15 @@ func main() {
 	sqliteProfileFile := flag.String("sqlite-profile-file", "sqlite_profiles.yaml", "SQLite profiles YAML file")
 	flag.Parse()
 
-	// Configure logging
+	// Configure logging early so everything below can use logger.Debug/Info.
 	if *debug {
 		logger.SetLogLevel(logger.DebugLevel)
 	} else {
 		logger.SetLogLevel(logger.InfoLevel)
 	}
 
+	// Load and apply the named profile from YAML, then override with per-flag values.
+	// This makes profiles the baseline but allows quick one-off tuning.
 	profiles, err := loadSQLiteProfiles(*sqliteProfileFile)
 	if err != nil {
 		log.Fatalf("Failed to load SQLite profiles: %v", err)
@@ -78,6 +90,7 @@ func main() {
 
 	comparer.ConfigureSQLiteTunables(*sqliteCacheKB, *sqliteMmapMB, *sqliteBatch, *sqliteWorkers)
 
+	// Remaining arguments are positional: old file, new file, and optional output path.
 	args := flag.Args()
 	if len(args) < 2 {
 		fmt.Fprintf(os.Stderr, "Usage: %s [--debug] old_dump.sql new_dump.sql [delta.sql]\n", os.Args[0])
@@ -97,10 +110,10 @@ func main() {
 	logger.Debug("main: New file: %s", newFile)
 	logger.Debug("main: Delta file: %s", deltaFile)
 
-	// Parse schemas to get primary keys and columns (in parallel with mpb)
+	// Parse schemas to get primary keys and columns (parallelized for speed).
 	schemaParser := parser.NewSchemaParser()
 
-	// Create progress container for multi-bar display
+	// Create a single progress container for all concurrent progress bars.
 	p := mpb.New(mpb.WithOutput(os.Stderr))
 
 	type schemaRes struct {
@@ -118,7 +131,7 @@ func main() {
 	oldColsCh := make(chan colsRes, 1)
 	newColsCh := make(chan colsRes, 1)
 
-	// Parse schemas in parallel
+	// Parse schemas in parallel (old/new).
 	go func() {
 		pk, err := schemaParser.ParseSchemas(oldFile, p)
 		oldSchemaCh <- schemaRes{pkMap: pk, err: err}
@@ -129,7 +142,7 @@ func main() {
 		newSchemaCh <- schemaRes{pkMap: pk, err: err}
 	}()
 
-	// Parse columns in parallel
+	// Parse columns in parallel (old/new).
 	go func() {
 		cols, err := schemaParser.ParseColumns(oldFile, p)
 		oldColsCh <- colsRes{cols: cols, err: err}
@@ -140,7 +153,7 @@ func main() {
 		newColsCh <- colsRes{cols: cols, err: err}
 	}()
 
-	// Wait for results
+	// Wait for results from all four parsing goroutines.
 	oldSchemaRes := <-oldSchemaCh
 	if oldSchemaRes.err != nil {
 		log.Fatalf("Error parsing old schema: %v", oldSchemaRes.err)
@@ -165,12 +178,12 @@ func main() {
 	}
 	newColsMap := newColsRes.cols
 
-	// Merge PK maps (prefer new file PKs)
+	// Merge PK maps (prefer new file PKs if both have a PK definition).
 	for table, pk := range newPKMap {
 		oldPKMap[table] = pk
 	}
 
-	// Generate delta
+	// Generate delta and stream output directly to the file/stdout.
 	dg := comparer.NewDeltaGenerator(oldPKMap, oldColsMap, newColsMap)
 	var out *os.File
 	if deltaFile != "" {
@@ -189,10 +202,10 @@ func main() {
 		log.Fatalf("Error generating delta: %v", err)
 	}
 
-	// Ensure progress bars are fully rendered before printing summary
+	// Ensure progress bars are fully rendered before printing summary text.
 	p.Wait()
 
-	// Print summary (Java-style)
+	// Print summary (Java-style formatting to match the Java tool).
 	sep := strings.Repeat("=", 60)
 	fmt.Printf("\n%s\nSUMMARY\n%s\n", sep, sep)
 	fmt.Printf("Inserts:  %d\n", summary.InsertCount)

@@ -14,14 +14,14 @@ import (
 	"github.com/younes/sqldumpdiff/internal/logger"
 )
 
-// SchemaParser handles parsing of SQL schemas to extract table information
+// SchemaParser handles parsing of SQL schemas to extract PKs and column lists.
 type SchemaParser struct {
 	createTableRegex *regexp.Regexp
 	primaryKeyRegex  *regexp.Regexp
 	columnRegex      *regexp.Regexp
 }
 
-// NewSchemaParser creates a new schema parser
+// NewSchemaParser creates a parser with regexes that handle qualified names.
 func NewSchemaParser() *SchemaParser {
 	// Use simple case-insensitive matching without regex flags since Go's regexp has limited support
 	return &SchemaParser{
@@ -31,7 +31,7 @@ func NewSchemaParser() *SchemaParser {
 	}
 }
 
-// ParseSchemas extracts primary key information from CREATE TABLE statements
+// ParseSchemas extracts PRIMARY KEY columns from CREATE TABLE statements.
 func (sp *SchemaParser) ParseSchemas(filename string, p *mpb.Progress) (map[string][]string, error) {
 	logger.Debug("ParseSchemas: Opening file %s", filename)
 	file, err := os.Open(filename)
@@ -41,7 +41,7 @@ func (sp *SchemaParser) ParseSchemas(filename string, p *mpb.Progress) (map[stri
 	}
 	defer file.Close()
 
-	// Get file size for progress bar
+	// Get file size for a byte-accurate progress bar.
 	fi, err := file.Stat()
 	if err != nil {
 		logger.Error("ParseSchemas: Failed to stat file: %v", err)
@@ -49,6 +49,7 @@ func (sp *SchemaParser) ParseSchemas(filename string, p *mpb.Progress) (map[stri
 	}
 	fileSize := fi.Size()
 
+	// Create a progress bar that tracks bytes read.
 	var bar *mpb.Bar
 	if p != nil {
 		bar = p.New(
@@ -154,7 +155,7 @@ func (sp *SchemaParser) ParseSchemas(filename string, p *mpb.Progress) (map[stri
 	return pkMap, nil
 }
 
-// ParseColumns extracts column names from CREATE TABLE statements
+// ParseColumns extracts column names from CREATE TABLE statements.
 func (sp *SchemaParser) ParseColumns(filename string, p *mpb.Progress) (map[string][]string, error) {
 	logger.Debug("ParseColumns: Opening file %s", filename)
 	file, err := os.Open(filename)
@@ -164,7 +165,7 @@ func (sp *SchemaParser) ParseColumns(filename string, p *mpb.Progress) (map[stri
 	}
 	defer file.Close()
 
-	// Get file size for progress bar
+	// Get file size for a byte-accurate progress bar.
 	fi, err := file.Stat()
 	if err != nil {
 		logger.Error("ParseColumns: Failed to stat file: %v", err)
@@ -172,6 +173,7 @@ func (sp *SchemaParser) ParseColumns(filename string, p *mpb.Progress) (map[stri
 	}
 	fileSize := fi.Size()
 
+	// Create a progress bar that tracks bytes read.
 	var bar *mpb.Bar
 	if p != nil {
 		bar = p.New(

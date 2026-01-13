@@ -13,14 +13,14 @@ import (
 	"github.com/younes/sqldumpdiff/internal/logger"
 )
 
-// InsertRow represents a parsed INSERT statement row
+// InsertRow represents a parsed INSERT row with table, columns, and data map.
 type InsertRow struct {
 	Table   string
 	Columns []string
 	Data    map[string]string
 }
 
-// InsertParser handles parsing of INSERT statements
+// InsertParser handles parsing of INSERT statements from dumps.
 type InsertParser struct {
 }
 
@@ -29,7 +29,8 @@ func NewInsertParser() *InsertParser {
 	return &InsertParser{}
 }
 
-// InsertAccumulator helps build complete INSERT statements across multiple lines
+// InsertAccumulator helps build complete INSERT statements across multiple lines.
+// It tracks quote/paren state to know when a statement is complete.
 type InsertAccumulator struct {
 	buffer              strings.Builder
 	inSingleQuote       bool
@@ -40,7 +41,7 @@ type InsertAccumulator struct {
 	statementsProcessed int
 }
 
-// ProcessLine processes a line and returns complete INSERT statements if any
+// ProcessLine processes a line and returns any complete INSERT statements found.
 func (acc *InsertAccumulator) ProcessLine(line string) []string {
 	var results []string
 
@@ -83,7 +84,7 @@ func (acc *InsertAccumulator) ProcessLine(line string) []string {
 	return results
 }
 
-// processLineContent tracks quote state and parenthesis depth
+// processLineContent tracks quote state and parenthesis depth while scanning a line.
 func (acc *InsertAccumulator) processLineContent(line string) {
 	for _, c := range line {
 		if acc.escapeNext {
@@ -108,7 +109,7 @@ func (acc *InsertAccumulator) processLineContent(line string) {
 	}
 }
 
-// Finalize returns any incomplete statement at EOF
+// Finalize returns any incomplete statement at EOF.
 func (acc *InsertAccumulator) Finalize() []string {
 	var results []string
 	if acc.inInsert && acc.buffer.Len() > 0 {
@@ -119,6 +120,7 @@ func (acc *InsertAccumulator) Finalize() []string {
 }
 
 // ParseInsertsStream reads INSERT statements from a file and calls onRow for each row.
+// This is the streaming entrypoint used by the comparer for large files.
 func (ip *InsertParser) ParseInsertsStream(filename string, columns map[string][]string, p *mpb.Progress, label string, onRow func(*InsertRow)) error {
 	logger.Debug("ParseInsertsStream: Opening file %s", filename)
 	file, err := os.Open(filename)
@@ -210,7 +212,8 @@ func (ip *InsertParser) ParseInsertsStream(filename string, columns map[string][
 	return nil
 }
 
-// ParseInserts reads INSERT statements from a file with progress reporting
+// ParseInserts reads INSERT statements and returns an in-memory map of rows.
+// This is used for smaller workflows; large-file flows use ParseInsertsStream.
 func (ip *InsertParser) ParseInserts(filename string, columns map[string][]string, p *mpb.Progress) (map[string][]*InsertRow, error) {
 	logger.Debug("ParseInserts: Opening file %s", filename)
 	file, err := os.Open(filename)
@@ -302,7 +305,7 @@ func (ip *InsertParser) ParseInserts(filename string, columns map[string][]strin
 	return tableRows, nil
 }
 
-// ExpandInsert parses a single INSERT statement into multiple rows
+// ExpandInsert parses a single INSERT statement into multiple rows.
 func (ip *InsertParser) ExpandInsert(insertStmt string, columnsMap map[string][]string) ([]*InsertRow, error) {
 	// Normalize whitespace
 	normalized := strings.Join(strings.Fields(insertStmt), " ")

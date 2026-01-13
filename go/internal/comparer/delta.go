@@ -41,11 +41,15 @@ type Summary struct {
 	DeleteCount int
 }
 
+// SQLite tuning knobs (defaults are overridden by CLI profiles/flags).
+// These are package-level so the CLI can update them once at startup.
 var sqliteBatchSize = 20000
 var sqliteCacheKB = 800000
 var sqliteMmapMB = 128
 var sqliteWorkers = 0
 
+// rowHash computes a deterministic hash of a row using column order.
+// We hash a canonical "col=value" sequence to quickly detect unchanged rows.
 func rowHash(row *parser.InsertRow) []byte {
 	var b strings.Builder
 	for _, col := range row.Columns {
@@ -59,6 +63,8 @@ func rowHash(row *parser.InsertRow) []byte {
 	return sum[:]
 }
 
+// splitDumpByTable streams INSERT rows and writes per-table JSONL files.
+// This mirrors the Java pipeline and keeps later comparisons table-local.
 func splitDumpByTable(dumpFile string, columnsMap map[string][]string, pkMap map[string][]string, tempDir string, label string, p *mpb.Progress, progressLabel string) (map[string]string, error) {
 	insertParser := parser.NewInsertParser()
 	writers := make(map[string]*bufio.Writer)
@@ -117,6 +123,8 @@ func splitDumpByTable(dumpFile string, columnsMap map[string][]string, pkMap map
 	return tablePaths, nil
 }
 
+// sanitizeFilename converts a table name into a safe filename and adds
+// a short hash suffix to avoid collisions.
 func sanitizeFilename(name string) string {
 	var b strings.Builder
 	for _, r := range name {
@@ -133,6 +141,8 @@ func sanitizeFilename(name string) string {
 	return fmt.Sprintf("%s_%s", b.String(), hex.EncodeToString(sum[:4]))
 }
 
+// resolveTableName maps a table name from INSERTs to the canonical PK map key.
+// This handles case-only differences between CREATE TABLE and INSERT sections.
 func resolveTableName(pkMap map[string][]string, name string) (string, bool) {
 	if _, ok := pkMap[name]; ok {
 		return name, true
@@ -146,6 +156,7 @@ func resolveTableName(pkMap map[string][]string, name string) (string, bool) {
 	return "", false
 }
 
+// loadTableJSONL reads a JSONL file (one row per line) and stores it in SQLite.
 func loadTableJSONL(db *sql.DB, path string, pkCols []string) error {
 	f, err := os.Open(path)
 	if err != nil {
@@ -208,6 +219,7 @@ func loadTableJSONL(db *sql.DB, path string, pkCols []string) error {
 	return nil
 }
 
+// compareNewRows streams the new JSONL file and produces inserts/updates.
 func compareNewRows(db *sql.DB, newFilePath string, pkCols []string, result *ComparisonResult, seen map[string]struct{}) error {
 	f, err := os.Open(newFilePath)
 	if err != nil {
@@ -274,6 +286,7 @@ func compareNewRows(db *sql.DB, newFilePath string, pkCols []string, result *Com
 	return nil
 }
 
+// emitDeletionsFromDB scans old rows and emits deletions for unseen PKs.
 func emitDeletionsFromDB(db *sql.DB, pkCols []string, seen map[string]struct{}, result *ComparisonResult) error {
 	rows, err := db.Query(`SELECT pk_hash, row_json FROM rows`)
 	if err != nil {
@@ -304,6 +317,8 @@ func emitDeletionsFromDB(db *sql.DB, pkCols []string, seen map[string]struct{}, 
 	return nil
 }
 
+// applySQLitePragmas configures SQLite for fast, temp-file workloads.
+// These settings prioritize throughput over durability.
 func applySQLitePragmas(db *sql.DB) error {
 	pragmas := []string{
 		"PRAGMA journal_mode=OFF;",
@@ -322,6 +337,8 @@ func applySQLitePragmas(db *sql.DB) error {
 	return nil
 }
 
+// setupSQLiteSchema creates the per-table rows table.
+// Each table DB stores only one table's rows.
 func setupSQLiteSchema(db *sql.DB) error {
 	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS rows (
@@ -338,6 +355,8 @@ func setupSQLiteSchema(db *sql.DB) error {
 	return nil
 }
 
+// beginSQLiteInsert starts a transaction and returns an insert statement.
+// We batch inserts for speed and commit every sqliteBatchSize rows.
 func beginSQLiteInsert(db *sql.DB) (*sql.Tx, *sql.Stmt, error) {
 	tx, err := db.Begin()
 	if err != nil {
@@ -418,6 +437,10 @@ func insertRowsToSQLite(db *sql.DB, insertParser *parser.InsertParser, filename 
 	return nil
 }
 
+// compareTableSQLite compares a single table:
+// 1) load old rows into SQLite
+// 2) stream new rows and emit inserts/updates
+// 3) emit deletions for unseen PKs
 func compareTableSQLite(table string, pkCols []string, oldFilePath, newFilePath string) (*ComparisonResult, error) {
 	result := &ComparisonResult{TableName: table}
 	if oldFilePath == "" && newFilePath == "" {
@@ -471,6 +494,7 @@ func compareTableSQLite(table string, pkCols []string, oldFilePath, newFilePath 
 }
 
 // ConfigureSQLiteTunables allows CLI to override defaults.
+// ConfigureSQLiteTunables allows the CLI to override defaults before processing.
 func ConfigureSQLiteTunables(cacheKB, mmapMB, batchSize, workers int) {
 	if cacheKB > 0 {
 		sqliteCacheKB = cacheKB
@@ -501,7 +525,10 @@ func NewDeltaGenerator(pkMap, oldColumnsMap, newColumnsMap map[string][]string) 
 	}
 }
 
-// GenerateDelta compares old and new dumps and generates delta to out.
+// GenerateDelta is the high-level pipeline:
+// 1) split dumps into per-table JSONL files
+// 2) compare tables in parallel using per-table SQLite DBs
+// 3) stream SQL output and return summary counts
 func (dg *DeltaGenerator) GenerateDelta(oldFile, newFile string, p *mpb.Progress, out io.Writer) (Summary, error) {
 	logger.Debug("GenerateDelta: Starting delta generation")
 	tmpDir, err := os.MkdirTemp("", "sqldumpdiff-sqlite-*")
