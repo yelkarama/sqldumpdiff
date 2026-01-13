@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 
 	"github.com/vbauerster/mpb/v8"
 	"github.com/younes/sqldumpdiff/internal/comparer"
@@ -188,15 +189,17 @@ func main() {
 		log.Fatalf("Error generating delta: %v", err)
 	}
 
-	// Print summary
-	fmt.Printf("Summary:\n")
-	fmt.Printf("  Inserts: %d\n", summary.InsertCount)
-	fmt.Printf("  Updates: %d\n", summary.UpdateCount)
-	fmt.Printf("  Deletes: %d\n", summary.DeleteCount)
-	fmt.Printf("  Total:   %d\n", summary.InsertCount+summary.UpdateCount+summary.DeleteCount)
-
-	// Ensure progress bars are fully rendered before exit
+	// Ensure progress bars are fully rendered before printing summary
 	p.Wait()
+
+	// Print summary (Java-style)
+	sep := strings.Repeat("=", 60)
+	fmt.Printf("\n%s\nSUMMARY\n%s\n", sep, sep)
+	fmt.Printf("Inserts:  %d\n", summary.InsertCount)
+	fmt.Printf("Updates:  %d\n", summary.UpdateCount)
+	fmt.Printf("Deletes:  %d\n", summary.DeleteCount)
+	fmt.Printf("Total:    %d\n", summary.InsertCount+summary.UpdateCount+summary.DeleteCount)
+	fmt.Printf("%s\n", sep)
 
 	logger.Debug("main: Delta generation complete")
 }

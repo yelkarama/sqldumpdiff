@@ -119,7 +119,7 @@ func (acc *InsertAccumulator) Finalize() []string {
 }
 
 // ParseInsertsStream reads INSERT statements from a file and calls onRow for each row.
-func (ip *InsertParser) ParseInsertsStream(filename string, columns map[string][]string, p *mpb.Progress, onRow func(*InsertRow)) error {
+func (ip *InsertParser) ParseInsertsStream(filename string, columns map[string][]string, p *mpb.Progress, label string, onRow func(*InsertRow)) error {
 	logger.Debug("ParseInsertsStream: Opening file %s", filename)
 	file, err := os.Open(filename)
 	if err != nil {
@@ -139,11 +139,15 @@ func (ip *InsertParser) ParseInsertsStream(filename string, columns map[string][
 
 	var bar *mpb.Bar
 	if p != nil {
+		desc := label
+		if desc == "" {
+			desc = fmt.Sprintf("Parsing %s", filepath.Base(filename))
+		}
 		bar = p.New(
 			fileSize,
 			mpb.BarStyle().Lbound("[").Filler("█").Tip("█").Padding(" ").Rbound("]"),
 			mpb.PrependDecorators(
-				decor.Name(fmt.Sprintf("Parsing %s", filepath.Base(filename)), decor.WC{W: 20, C: decor.DindentRight | decor.DextraSpace}),
+				decor.Name(desc, decor.WC{W: 20, C: decor.DindentRight | decor.DextraSpace}),
 				decor.CountersKibiByte("% .2f / % .2f", decor.WC{W: 18, C: decor.DindentRight | decor.DextraSpace}),
 			),
 			mpb.AppendDecorators(

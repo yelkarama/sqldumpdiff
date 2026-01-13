@@ -19,6 +19,7 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 
 	"github.com/vbauerster/mpb/v8"
+	"github.com/vbauerster/mpb/v8/decor"
 	"github.com/younes/sqldumpdiff/internal/logger"
 	"github.com/younes/sqldumpdiff/internal/parser"
 )
@@ -62,13 +63,13 @@ func rowHash(row *parser.InsertRow) []byte {
 	return sum[:]
 }
 
-func splitDumpByTable(dumpFile string, columnsMap map[string][]string, pkMap map[string][]string, tempDir string, label string, p *mpb.Progress) (map[string]string, error) {
+func splitDumpByTable(dumpFile string, columnsMap map[string][]string, pkMap map[string][]string, tempDir string, label string, p *mpb.Progress, progressLabel string) (map[string]string, error) {
 	insertParser := parser.NewInsertParser()
 	writers := make(map[string]*bufio.Writer)
 	files := make(map[string]*os.File)
 	tablePaths := make(map[string]string)
 
-	err := insertParser.ParseInsertsStream(dumpFile, columnsMap, p, func(row *parser.InsertRow) {
+	err := insertParser.ParseInsertsStream(dumpFile, columnsMap, p, progressLabel, func(row *parser.InsertRow) {
 		if _, ok := pkMap[row.Table]; !ok {
 			return
 		}
@@ -335,7 +336,7 @@ func insertRowsToSQLite(db *sql.DB, insertParser *parser.InsertParser, filename 
 	batchCount := 0
 	var firstErr error
 
-	err = insertParser.ParseInsertsStream(filename, columns, p, func(row *parser.InsertRow) {
+	err = insertParser.ParseInsertsStream(filename, columns, p, "", func(row *parser.InsertRow) {
 		if firstErr != nil {
 			return
 		}
@@ -502,7 +503,7 @@ func (dg *DeltaGenerator) GenerateDelta(oldFile, newFile string, p *mpb.Progress
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		m, err := splitDumpByTable(oldFile, dg.oldColumnsMap, dg.pkMap, tmpDir, "old", p)
+		m, err := splitDumpByTable(oldFile, dg.oldColumnsMap, dg.pkMap, tmpDir, "old", p, "Parsing old dump")
 		if err != nil {
 			splitErr = err
 			return
@@ -513,7 +514,7 @@ func (dg *DeltaGenerator) GenerateDelta(oldFile, newFile string, p *mpb.Progress
 	}()
 	go func() {
 		defer wg.Done()
-		m, err := splitDumpByTable(newFile, dg.newColumnsMap, dg.pkMap, tmpDir, "new", p)
+		m, err := splitDumpByTable(newFile, dg.newColumnsMap, dg.pkMap, tmpDir, "new", p, "Parsing new dump")
 		if err != nil {
 			splitErr = err
 			return
@@ -545,6 +546,21 @@ func (dg *DeltaGenerator) GenerateDelta(oldFile, newFile string, p *mpb.Progress
 		maxWorkers = sqliteWorkers
 	}
 	sem := make(chan struct{}, maxWorkers)
+
+	var compareBar *mpb.Bar
+	if p != nil && len(allTables) > 0 {
+		compareBar = p.New(
+			int64(len(allTables)),
+			mpb.BarStyle().Lbound("[").Filler("█").Tip("█").Padding(" ").Rbound("]"),
+			mpb.PrependDecorators(
+				decor.Name("Comparing tables", decor.WC{W: 20, C: decor.DindentRight | decor.DextraSpace}),
+				decor.CountersNoUnit("%d / %d", decor.WC{W: 18, C: decor.DindentRight | decor.DextraSpace}),
+			),
+			mpb.AppendDecorators(
+				decor.Percentage(decor.WC{W: 5}),
+			),
+		)
+	}
 
 	compareWg := sync.WaitGroup{}
 	for table := range allTables {
@@ -580,9 +596,15 @@ func (dg *DeltaGenerator) GenerateDelta(oldFile, newFile string, p *mpb.Progress
 			summary.UpdateCount += res.UpdateCount
 			summary.DeleteCount += res.DeleteCount
 			sumMu.Unlock()
+			if compareBar != nil {
+				compareBar.IncrBy(1)
+			}
 		}(table, pkCols, oldPath, newPath)
 	}
 	compareWg.Wait()
+	if compareBar != nil {
+		compareBar.SetTotal(int64(len(allTables)), true)
+	}
 
 	fmt.Fprintln(out, "SET FOREIGN_KEY_CHECKS = 1;")
 	logger.Debug("GenerateDelta: Completed")
