@@ -84,7 +84,13 @@ jobs:
           OUT="sqldumpdiff-${{ matrix.os }}-${{ matrix.arch }}.exe"
           GOOS="${{ matrix.os }}" GOARCH="${{ matrix.arch }}" go build -o "$OUT" ./cmd/sqldumpdiff
           mkdir -p dist
-          zip -j "dist/${OUT}.zip" "$OUT"
+          cp "$OUT" "dist/${OUT}"
+      - name: Zip (windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          $out = "sqldumpdiff-${{ matrix.os }}-${{ matrix.arch }}.exe"
+          Compress-Archive -Path "go/dist/$out" -DestinationPath "go/dist/$out.zip" -Force
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
