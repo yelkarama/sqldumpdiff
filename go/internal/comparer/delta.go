@@ -11,7 +11,7 @@ import (
 	"sort"
 	"strings"
 
-	_ "modernc.org/sqlite"
+	_ "github.com/mattn/go-sqlite3"
 
 	"github.com/vbauerster/mpb/v8"
 	"github.com/younes/sqldumpdiff/internal/logger"
@@ -463,7 +463,7 @@ func (dg *DeltaGenerator) GenerateDelta(oldFile, newFile string, p *mpb.Progress
 	defer os.RemoveAll(tmpDir)
 
 	dbPath := tmpDir + string(os.PathSeparator) + "sqldumpdiff.db"
-	db, err := sql.Open("sqlite", dbPath)
+	db, err := sql.Open("sqlite3", dbPath)
 	if err != nil {
 		return Summary{}, fmt.Errorf("open sqlite: %w", err)
 	}
