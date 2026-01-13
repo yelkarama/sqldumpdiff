@@ -39,6 +39,27 @@ go install ./cmd/sqldumpdiff
 ./sqldumpdiff old_dump.sql new_dump.sql
 ```
 
+## SQLite Tuning Flags
+
+These flags let you trade memory for speed. Defaults reflect the current tuned values.
+
+```bash
+# Adjust SQLite memory usage and concurrency
+./sqldumpdiff \
+  --sqlite-cache-kb 800000 \
+  --sqlite-mmap-mb 128 \
+  --sqlite-batch 20000 \
+  --sqlite-workers 0 \
+  old_dump.sql new_dump.sql delta.sql
+```
+
+Flag details:
+- `--sqlite-profile`: `low-mem`, `balanced`, or `fast` (applies a preset, then per-flag overrides apply).
+- `--sqlite-cache-kb`: SQLite page cache size in KB (negative means KB). Lower it to reduce RSS.
+- `--sqlite-mmap-mb`: SQLite mmap size in MB. Lower to reduce RSS.
+- `--sqlite-batch`: Rows per insert batch. Higher can improve speed at the cost of memory.
+- `--sqlite-workers`: Max concurrent table comparisons. `0` uses `NumCPU`.
+
 ## Project Structure
 
 ```

@@ -10,11 +10,52 @@ import (
 	"github.com/younes/sqldumpdiff/internal/comparer"
 	"github.com/younes/sqldumpdiff/internal/logger"
 	"github.com/younes/sqldumpdiff/internal/parser"
+	"gopkg.in/yaml.v3"
 )
+
+type sqliteProfilesFile struct {
+	Profiles map[string]sqliteProfile `yaml:"profiles"`
+}
+
+type sqliteProfile struct {
+	CacheKB int `yaml:"cache_kb"`
+	MmapMB  int `yaml:"mmap_mb"`
+	Batch   int `yaml:"batch"`
+	Workers int `yaml:"workers"`
+}
+
+func loadSQLiteProfiles(path string) (map[string]sqliteProfile, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var cfg sqliteProfilesFile
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return nil, err
+	}
+	if len(cfg.Profiles) == 0 {
+		return nil, fmt.Errorf("no profiles found in %s", path)
+	}
+	return cfg.Profiles, nil
+}
+
+func profileKeys(m map[string]sqliteProfile) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
+}
 
 func main() {
 	// Parse command line arguments
 	debug := flag.Bool("debug", false, "Enable debug logging")
+	sqliteCacheKB := flag.Int("sqlite-cache-kb", 800000, "SQLite cache size in KB (negative means KB)")
+	sqliteMmapMB := flag.Int("sqlite-mmap-mb", 128, "SQLite mmap size in MB")
+	sqliteBatch := flag.Int("sqlite-batch", 20000, "SQLite insert batch size")
+	sqliteWorkers := flag.Int("sqlite-workers", 0, "Max concurrent table compares (0 = NumCPU)")
+	sqliteProfile := flag.String("sqlite-profile", "fast", "SQLite tuning profile: low-mem, balanced, fast")
+	sqliteProfileFile := flag.String("sqlite-profile-file", "sqlite_profiles.yaml", "SQLite profiles YAML file")
 	flag.Parse()
 
 	// Configure logging
@@ -23,6 +64,18 @@ func main() {
 	} else {
 		logger.SetLogLevel(logger.InfoLevel)
 	}
+
+	profiles, err := loadSQLiteProfiles(*sqliteProfileFile)
+	if err != nil {
+		log.Fatalf("Failed to load SQLite profiles: %v", err)
+	}
+	profile, ok := profiles[*sqliteProfile]
+	if !ok {
+		log.Fatalf("Invalid --sqlite-profile value: %s (available: %v)", *sqliteProfile, profileKeys(profiles))
+	}
+	comparer.ConfigureSQLiteTunables(profile.CacheKB, profile.MmapMB, profile.Batch, profile.Workers)
+
+	comparer.ConfigureSQLiteTunables(*sqliteCacheKB, *sqliteMmapMB, *sqliteBatch, *sqliteWorkers)
 
 	args := flag.Args()
 	if len(args) < 2 {

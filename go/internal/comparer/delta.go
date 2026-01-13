@@ -40,7 +40,10 @@ type Summary struct {
 	DeleteCount int
 }
 
-const sqliteBatchSize = 20000
+var sqliteBatchSize = 20000
+var sqliteCacheKB = 800000
+var sqliteMmapMB = 128
+var sqliteWorkers = 0
 
 func rowHash(row *parser.InsertRow) []byte {
 	keys := make([]string, 0, len(row.Data))
@@ -280,9 +283,9 @@ func applySQLitePragmas(db *sql.DB) error {
 		"PRAGMA journal_mode=OFF;",
 		"PRAGMA synchronous=OFF;",
 		"PRAGMA temp_store=MEMORY;",
-		"PRAGMA cache_size=-800000;",
+		fmt.Sprintf("PRAGMA cache_size=%d;", -sqliteCacheKB),
 		"PRAGMA page_size=32768;",
-		"PRAGMA mmap_size=134217728;",
+		fmt.Sprintf("PRAGMA mmap_size=%d;", sqliteMmapMB<<20),
 		"PRAGMA busy_timeout=5000;",
 	}
 	for _, pragma := range pragmas {
@@ -440,6 +443,22 @@ func compareTableSQLite(table string, pkCols []string, oldFilePath, newFilePath 
 
 	return result, nil
 }
+
+// ConfigureSQLiteTunables allows CLI to override defaults.
+func ConfigureSQLiteTunables(cacheKB, mmapMB, batchSize, workers int) {
+	if cacheKB > 0 {
+		sqliteCacheKB = cacheKB
+	}
+	if mmapMB >= 0 {
+		sqliteMmapMB = mmapMB
+	}
+	if batchSize > 0 {
+		sqliteBatchSize = batchSize
+	}
+	if workers >= 0 {
+		sqliteWorkers = workers
+	}
+}
 // DeltaGenerator generates delta SQL between two dumps
 type DeltaGenerator struct {
 	pkMap         map[string][]string
@@ -522,6 +541,9 @@ func (dg *DeltaGenerator) GenerateDelta(oldFile, newFile string, p *mpb.Progress
 	var sumMu sync.Mutex
 
 	maxWorkers := runtime.NumCPU()
+	if sqliteWorkers > 0 {
+		maxWorkers = sqliteWorkers
+	}
 	sem := make(chan struct{}, maxWorkers)
 
 	compareWg := sync.WaitGroup{}
