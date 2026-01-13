@@ -552,7 +552,7 @@ func parseValuesWithQuotes(valuesStr string) []string {
 		if !inSingleQuote && !inDoubleQuote && depth == 0 && c == ',' {
 			val := strings.TrimSpace(buf.String())
 			if val == "NULL" {
-				values = append(values, "")
+				values = append(values, "NULL")
 			} else {
 				values = append(values, val)
 			}
@@ -565,7 +565,7 @@ func parseValuesWithQuotes(valuesStr string) []string {
 	// Last value
 	val := strings.TrimSpace(buf.String())
 	if val == "NULL" {
-		values = append(values, "")
+		values = append(values, "NULL")
 	} else {
 		values = append(values, val)
 	}

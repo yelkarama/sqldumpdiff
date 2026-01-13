@@ -47,16 +47,12 @@ var sqliteMmapMB = 128
 var sqliteWorkers = 0
 
 func rowHash(row *parser.InsertRow) []byte {
-	keys := make([]string, 0, len(row.Data))
-	for k := range row.Data {
-		keys = append(keys, strings.ToLower(k))
-	}
-	sort.Strings(keys)
 	var b strings.Builder
-	for _, k := range keys {
-		b.WriteString(k)
+	for _, col := range row.Columns {
+		b.WriteString(strings.ToLower(col))
 		b.WriteString("=")
-		b.WriteString(normalizeNull(row.Data[k]))
+		val := getColumnValueCaseInsensitive(row, col)
+		b.WriteString(normalizeNull(val))
 		b.WriteString(";")
 	}
 	sum := sha256.Sum256([]byte(b.String()))
@@ -68,23 +64,28 @@ func splitDumpByTable(dumpFile string, columnsMap map[string][]string, pkMap map
 	writers := make(map[string]*bufio.Writer)
 	files := make(map[string]*os.File)
 	tablePaths := make(map[string]string)
+	missingTables := make(map[string]bool)
+	seenTables := make(map[string]bool)
 
 	err := insertParser.ParseInsertsStream(dumpFile, columnsMap, p, progressLabel, func(row *parser.InsertRow) {
-		if _, ok := pkMap[row.Table]; !ok {
+		seenTables[row.Table] = true
+		resolved, ok := resolveTableName(pkMap, row.Table)
+		if !ok {
+			missingTables[row.Table] = true
 			return
 		}
-		bw, ok := writers[row.Table]
+		bw, ok := writers[resolved]
 		if !ok {
-			name := sanitizeFilename(row.Table)
+			name := sanitizeFilename(resolved)
 			path := filepath.Join(tempDir, fmt.Sprintf("%s_%s.jsonl", label, name))
 			f, e := os.Create(path)
 			if e != nil {
 				return
 			}
-			files[row.Table] = f
+			files[resolved] = f
 			bw = bufio.NewWriter(f)
-			writers[row.Table] = bw
-			tablePaths[row.Table] = path
+			writers[resolved] = bw
+			tablePaths[resolved] = path
 		}
 		jsonStr, e := row.ToJSON()
 		if e != nil {
@@ -104,6 +105,15 @@ func splitDumpByTable(dumpFile string, columnsMap map[string][]string, pkMap map
 	if err != nil {
 		return nil, err
 	}
+	if len(missingTables) > 0 {
+		names := make([]string, 0, len(missingTables))
+		for name := range missingTables {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		logger.Debug("splitDumpByTable: %s missing PK tables (%d): %s", label, len(names), strings.Join(names, ", "))
+	}
+	logger.Debug("splitDumpByTable: %s saw %d tables in INSERTs, wrote %d table files", label, len(seenTables), len(tablePaths))
 	return tablePaths, nil
 }
 
@@ -117,9 +127,23 @@ func sanitizeFilename(name string) string {
 		}
 	}
 	if b.Len() == 0 {
-		return "table"
+		b.WriteString("table")
 	}
-	return b.String()
+	sum := sha256.Sum256([]byte(name))
+	return fmt.Sprintf("%s_%s", b.String(), hex.EncodeToString(sum[:4]))
+}
+
+func resolveTableName(pkMap map[string][]string, name string) (string, bool) {
+	if _, ok := pkMap[name]; ok {
+		return name, true
+	}
+	lower := strings.ToLower(name)
+	for key := range pkMap {
+		if strings.ToLower(key) == lower {
+			return key, true
+		}
+	}
+	return "", false
 }
 
 func loadTableJSONL(db *sql.DB, path string, pkCols []string) error {
@@ -235,6 +259,7 @@ func compareNewRows(db *sql.DB, newFilePath string, pkCols []string, result *Com
 		}
 		updates := findUpdates(oldRow, newRow)
 		if len(updates) > 0 {
+			result.Changes += fmt.Sprintf("-- TABLE %s\n", newRow.Table)
 			for col, oldVal := range updates {
 				result.Changes += fmt.Sprintf("-- %s old value: %s\n", col, oldVal)
 			}
@@ -536,6 +561,7 @@ func (dg *DeltaGenerator) GenerateDelta(oldFile, newFile string, p *mpb.Progress
 	for t := range newTableFiles {
 		allTables[t] = true
 	}
+	logger.Debug("GenerateDelta: old tables=%d new tables=%d all=%d pkMap=%d", len(oldTableFiles), len(newTableFiles), len(allTables), len(dg.pkMap))
 
 	logger.Debug("GenerateDelta: Comparing %d tables", len(allTables))
 	var outMu sync.Mutex
@@ -640,8 +666,9 @@ func hashPK(row *parser.InsertRow, pkCols []string) string {
 
 func findUpdates(oldRow, newRow *parser.InsertRow) map[string]string {
 	updates := make(map[string]string)
-	for col, newVal := range newRow.Data {
-		oldVal := oldRow.Data[col]
+	for _, col := range newRow.Columns {
+		newVal := getColumnValueCaseInsensitive(newRow, col)
+		oldVal := getColumnValueCaseInsensitive(oldRow, col)
 		oldNorm := normalizeNull(oldVal)
 		newNorm := normalizeNull(newVal)
 		if oldNorm != newNorm {
@@ -653,7 +680,10 @@ func findUpdates(oldRow, newRow *parser.InsertRow) map[string]string {
 }
 
 func normalizeNull(val string) string {
-	if val == "" || strings.ToUpper(val) == "NULL" {
+	if strings.ToUpper(val) == "NULL" {
+		return "\x00"
+	}
+	if val == "" {
 		return ""
 	}
 
@@ -708,7 +738,7 @@ func buildWhereClause(row *parser.InsertRow, pkCols []string) string {
 	for _, col := range pkCols {
 		val := row.Data[col]
 		normalized := normalizeNull(val)
-		if normalized == "" {
+		if normalized == "\x00" {
 			parts = append(parts, fmt.Sprintf("`%s` IS NULL", col))
 		} else {
 			// Re-escape quotes for SQL
@@ -723,7 +753,7 @@ func buildWhereClause(row *parser.InsertRow, pkCols []string) string {
 // Handles normalized values (quotes removed) and NULL
 func formatSQLValue(val string) string {
 	normalized := normalizeNull(val)
-	if normalized == "" {
+	if normalized == "\x00" {
 		return "NULL"
 	}
 	// Escape single quotes for SQL
