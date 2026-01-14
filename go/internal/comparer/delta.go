@@ -400,13 +400,13 @@ func insertRowsToSQLite(db *sql.DB, insertParser *parser.InsertParser, filename 
 			return
 		}
 		batchCount++
-			if batchCount >= sqliteBatchSize {
-				if e := stmt.Close(); e != nil && firstErr == nil {
-					firstErr = e
-					return
-				}
-				if e := tx.Commit(); e != nil && firstErr == nil {
-					firstErr = e
+		if batchCount >= sqliteBatchSize {
+			if e := stmt.Close(); e != nil && firstErr == nil {
+				firstErr = e
+				return
+			}
+			if e := tx.Commit(); e != nil && firstErr == nil {
+				firstErr = e
 				return
 			}
 			nextTx, nextStmt, nextErr := beginSQLiteInsert(db)
@@ -414,10 +414,10 @@ func insertRowsToSQLite(db *sql.DB, insertParser *parser.InsertParser, filename 
 				firstErr = nextErr
 				return
 			}
-				tx = nextTx
-				stmt = nextStmt
-				batchCount = 0
-			}
+			tx = nextTx
+			stmt = nextStmt
+			batchCount = 0
+		}
 	})
 	if err != nil {
 		_ = tx.Rollback()
@@ -509,6 +509,7 @@ func ConfigureSQLiteTunables(cacheKB, mmapMB, batchSize, workers int) {
 		sqliteWorkers = workers
 	}
 }
+
 // DeltaGenerator generates delta SQL between two dumps
 type DeltaGenerator struct {
 	pkMap         map[string][]string
