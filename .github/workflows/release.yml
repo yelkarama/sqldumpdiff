@@ -99,7 +99,7 @@ jobs:
       - name: Upload JAR artifact
         uses: actions/upload-artifact@v4
         with:
-          name: java-jar
+          name: sqldumpdiff-jar
           path: java/dist/sqldumpdiff.jar
 
   java-native-linux:
