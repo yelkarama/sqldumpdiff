@@ -40,15 +40,23 @@ jobs:
           install: >-
             mingw-w64-ucrt-x86_64-gcc
             mingw-w64-ucrt-x86_64-pkgconf
-      - name: Build
-        shell: ${{ matrix.os == 'windows' && 'msys2 {0}' || 'bash' }}
+      - name: Build (non-windows)
+        if: matrix.os != 'windows'
+        shell: bash
         run: |
           set -euo pipefail
           cd go
           OUT="sqldumpdiff-${{ matrix.os }}-${{ matrix.arch }}"
-          if [[ "${{ matrix.os }}" == "windows" ]]; then
-            OUT="${OUT}.exe"
-          fi
+          GOOS="${{ matrix.os }}" GOARCH="${{ matrix.arch }}" go build -ldflags="-s -w" -o "$OUT" ./cmd/sqldumpdiff
+          mkdir -p dist
+          cp "$OUT" "dist/${OUT}"
+      - name: Build (windows)
+        if: matrix.os == 'windows'
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          cd go
+          OUT="sqldumpdiff-${{ matrix.os }}-${{ matrix.arch }}.exe"
           GOOS="${{ matrix.os }}" GOARCH="${{ matrix.arch }}" go build -ldflags="-s -w" -o "$OUT" ./cmd/sqldumpdiff
           mkdir -p dist
           cp "$OUT" "dist/${OUT}"
