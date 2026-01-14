@@ -13,7 +13,7 @@ use comparer::{DeltaGenerator, SqliteTunables};
 use parser::schema::SchemaParser;
 use std::fs::File;
 use std::io::{self, Write};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use std::thread;
 
