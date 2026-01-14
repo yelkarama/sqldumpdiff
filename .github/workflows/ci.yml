@@ -62,3 +62,13 @@ jobs:
           python3 -m pip install ruff
           ruff --version
           ruff check python/sqldumpdiff.py
+
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Rust build
+        run: |
+          cd rust
+          cargo build --release

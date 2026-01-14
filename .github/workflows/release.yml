@@ -97,7 +97,6 @@ jobs:
         with:
           java-version: "25"
           distribution: "graalvm"
-          components: "native-image"
       - name: Build native image
         run: |
           cd java
@@ -119,7 +118,6 @@ jobs:
         with:
           java-version: "25"
           distribution: "graalvm"
-          components: "native-image"
       - name: Build native image
         shell: bash
         run: |
@@ -173,10 +171,7 @@ jobs:
             artifact: sqldumpdiff-rust-macos-arm64
     steps:
       - uses: actions/checkout@v4
-      - uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          override: true
+      - uses: dtolnay/rust-toolchain@stable
       - name: Build
         shell: bash
         run: |
