@@ -9,6 +9,8 @@ import java.io.Writer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.SQLException;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -30,7 +32,7 @@ import me.tongfei.progressbar.ProgressBar;
 @Log
 public class DeltaGenerator {
 
-    public void generateDelta(String oldFilePath, String newFilePath, String outputPath, boolean debug)
+    public void generateDelta(String oldFilePath, String newFilePath, String outputPath, boolean debug, boolean timing, String timingJsonPath, Instant startTime, Instant wallStart)
             throws IOException, InterruptedException, ExecutionException {
 
         Path oldFile = Path.of(oldFilePath);
@@ -47,6 +49,8 @@ public class DeltaGenerator {
             System.err.println("Step 1: Parsing schemas from DDL...");
         }
         log.info("Step 1: Parsing schemas from DDL...");
+        Instant schemaStart = Instant.now();
+        long schemaMs = 0;
 
         SchemaParser schemaParser = new SchemaParser();
         Map<String, List<String>> pkMap;
@@ -64,6 +68,7 @@ public class DeltaGenerator {
             pb.step();
         }
 
+        schemaMs = Duration.between(schemaStart, Instant.now()).toMillis();
         if (pkMap.isEmpty()) {
             System.err.println("Warning: No tables with PRIMARY KEY found in new file schema.");
         }
@@ -72,6 +77,8 @@ public class DeltaGenerator {
             System.err.println("Step 2: Splitting dumps by table using virtual threads...");
         }
         log.info("Step 2: Splitting dumps by table using virtual threads...");
+        Instant splitStart = Instant.now();
+        long splitMs = 0;
 
         Path tempDir = Files.createTempDirectory("sqldumpdiff_");
         try {
@@ -93,6 +100,10 @@ public class DeltaGenerator {
 
                     oldTableFiles = oldFuture.get();
                     newTableFiles = newFuture.get();
+                }
+                splitMs = Duration.between(splitStart, Instant.now()).toMillis();
+                if (debug || timing) {
+                    log.info("Timing: split dumps took " + splitMs + "ms");
                 }
 
                 // Flush stderr to ensure progress bars are fully rendered before continuing
@@ -120,20 +131,29 @@ public class DeltaGenerator {
                         .toList();
 
                 List<ComparisonResult> results = new ArrayList<>();
+                List<TableTiming> timings = new ArrayList<>();
+                Instant compareStart = Instant.now();
+                long compareMs = 0;
                 try (ProgressBar pb = pbFactory.create("Comparing tables", comparisons.size());
                         ExecutorService compareExecutor = Executors.newVirtualThreadPerTaskExecutor()) {
 
-                    List<Future<ComparisonResult>> futures = comparisons.stream()
+                    List<Future<TableCompareResult>> futures = comparisons.stream()
                             .map(comp -> compareExecutor.submit(() -> {
-                                ComparisonResult result = compareTable(comp);
+                                TableCompareResult result = compareTable(comp);
                                 pb.step();
                                 return result;
                             }))
                             .toList();
 
-                    for (Future<ComparisonResult> future : futures) {
-                        results.add(future.get());
+                    for (Future<TableCompareResult> future : futures) {
+                        TableCompareResult res = future.get();
+                        results.add(res.result());
+                        timings.add(res.timing());
                     }
+                }
+                compareMs = Duration.between(compareStart, Instant.now()).toMillis();
+                if (debug || timing) {
+                    log.info("Timing: compare tables took " + compareMs + "ms");
                 }
 
                 log.info("Step 4: Writing delta script...");
@@ -142,8 +162,18 @@ public class DeltaGenerator {
                         .mapToInt(r -> r.insertCount() + r.updateCount() + r.deleteCount())
                         .sum();
 
+                Instant writeStart = Instant.now();
+                long writeMs = 0;
+                long writeFormatMs = 0;
+                long writeIoMs = 0;
                 try (ProgressBar pb = pbFactory.create("Writing delta SQL", Math.max(totalChanges, 1))) {
-                    writeDeltaScript(results, outputPath, pb);
+                    WriteTiming wt = writeDeltaScript(results, outputPath, pb);
+                    writeFormatMs = wt.formatMs();
+                    writeIoMs = wt.ioMs();
+                }
+                writeMs = Duration.between(writeStart, Instant.now()).toMillis();
+                if (debug || timing) {
+                    log.info("Timing: write delta SQL took " + writeMs + "ms");
                 }
 
                 // Print summary
@@ -158,6 +188,24 @@ public class DeltaGenerator {
                         totalInserts + totalUpdates + totalDeletes,
                         "=".repeat(60));
                 System.err.println(summary);
+
+                if (debug || timing) {
+                    timings.sort(Comparator.comparingLong(TableTiming::totalMs).reversed());
+                    int limit = Math.min(10, timings.size());
+                    if (limit > 0) {
+                        log.info("Timing: top " + limit + " slowest tables (ms):");
+                        for (int i = 0; i < limit; i++) {
+                            TableTiming t = timings.get(i);
+                            log.info(String.format("  %s total=%d load=%d compare=%d delete=%d",
+                                    t.tableName(), t.totalMs(), t.loadMs(), t.compareMs(), t.deleteMs()));
+                        }
+                    }
+                }
+
+                if (timingJsonPath != null && !timingJsonPath.isBlank()) {
+                    long wallMs = Duration.between(wallStart, Instant.now()).toMillis();
+                    writeTimingJsonReport(timingJsonPath, timings, schemaMs, splitMs, compareMs, writeMs, writeFormatMs, writeIoMs, wallMs);
+                }
                 log.log(java.util.logging.Level.INFO, "Completed with {0} inserts, {1} updates, {2} deletes",
                         new Object[] { totalInserts, totalUpdates, totalDeletes });
             }
@@ -238,34 +286,47 @@ public class DeltaGenerator {
         return tablePaths;
     }
 
-    private ComparisonResult compareTable(TableComparison comparison) {
+    private TableCompareResult compareTable(TableComparison comparison) {
         try {
             TableComparer comparer = new TableComparer();
-            ComparisonResult result = comparer.compare(comparison);
+            TableCompareResult result = comparer.compare(comparison);
 
             // Log detailed comparison results
-            if (result.insertCount() > 0 || result.updateCount() > 0 || result.deleteCount() > 0) {
+            ComparisonResult res = result.result();
+            if (res.insertCount() > 0 || res.updateCount() > 0 || res.deleteCount() > 0) {
                 log.log(java.util.logging.Level.FINE, "Table {0}: {1} inserts, {2} updates, {3} deletes",
-                        new Object[] { result.tableName(), result.insertCount(), result.updateCount(),
-                                result.deleteCount() });
+                        new Object[] { res.tableName(), res.insertCount(), res.updateCount(),
+                                res.deleteCount() });
             }
 
             return result;
         } catch (IOException | SQLException e) {
             System.err.println("Error comparing table " + comparison.tableName() + ": " + e.getMessage());
-            return new ComparisonResult(comparison.tableName(), "", "", 0, 0, 0);
+            return new TableCompareResult(
+                    new ComparisonResult(comparison.tableName(), "", "", 0, 0, 0),
+                    new TableTiming(comparison.tableName(), 0, 0, 0));
         }
     }
 
-    private void writeDeltaScript(List<ComparisonResult> results, String outputPath, ProgressBar progressBar)
+    private WriteTiming writeDeltaScript(List<ComparisonResult> results, String outputPath, ProgressBar progressBar)
             throws IOException {
         Writer out = outputPath != null
                 ? Files.newBufferedWriter(Path.of(outputPath))
                 : new OutputStreamWriter(System.out);
 
+        long formatMs = 0;
+        long ioMs = 0;
+
         try (Writer _ = outputPath != null ? out : null) {
-            out.write("-- Full Delta Update Script\n");
-            out.write("SET FOREIGN_KEY_CHECKS = 0;\n\n");
+            long fmtStart = System.nanoTime();
+            StringBuilder header = new StringBuilder();
+            header.append("-- Full Delta Update Script\n");
+            header.append("SET FOREIGN_KEY_CHECKS = 0;\n\n");
+            formatMs += (System.nanoTime() - fmtStart) / 1_000_000L;
+
+            long ioStart = System.nanoTime();
+            out.write(header.toString());
+            ioMs += (System.nanoTime() - ioStart) / 1_000_000L;
 
             // Sort by table name for deterministic output
             results.sort(Comparator.comparing(ComparisonResult::tableName));
@@ -273,8 +334,15 @@ public class DeltaGenerator {
             // Write changes (inserts/updates)
             for (ComparisonResult result : results) {
                 if (!result.changes().isEmpty()) {
-                    out.write("-- TABLE " + result.tableName() + "\n");
-                    out.write(result.changes());
+                    long fStart = System.nanoTime();
+                    StringBuilder chunk = new StringBuilder();
+                    chunk.append("-- TABLE ").append(result.tableName()).append("\n");
+                    chunk.append(result.changes());
+                    formatMs += (System.nanoTime() - fStart) / 1_000_000L;
+
+                    long wStart = System.nanoTime();
+                    out.write(chunk.toString());
+                    ioMs += (System.nanoTime() - wStart) / 1_000_000L;
                     if (progressBar != null) {
                         progressBar.stepBy(result.insertCount() + result.updateCount());
                     }
@@ -282,23 +350,92 @@ public class DeltaGenerator {
             }
 
             // Write deletions
-            out.write("-- DELETIONS\n");
+            long fStart = System.nanoTime();
+            StringBuilder delHeader = new StringBuilder();
+            delHeader.append("-- DELETIONS\n");
+            formatMs += (System.nanoTime() - fStart) / 1_000_000L;
+
+            long wStart = System.nanoTime();
+            out.write(delHeader.toString());
+            ioMs += (System.nanoTime() - wStart) / 1_000_000L;
             for (ComparisonResult result : results) {
                 if (!result.deletions().isEmpty()) {
-                    out.write("-- TABLE " + result.tableName() + "\n");
-                    out.write(result.deletions());
+                    long dfStart = System.nanoTime();
+                    StringBuilder dchunk = new StringBuilder();
+                    dchunk.append("-- TABLE ").append(result.tableName()).append("\n");
+                    dchunk.append(result.deletions());
+                    formatMs += (System.nanoTime() - dfStart) / 1_000_000L;
+
+                    long dwStart = System.nanoTime();
+                    out.write(dchunk.toString());
+                    ioMs += (System.nanoTime() - dwStart) / 1_000_000L;
                     if (progressBar != null) {
                         progressBar.stepBy(result.deleteCount());
                     }
                 }
             }
 
-            out.write("SET FOREIGN_KEY_CHECKS = 1;\n");
+            long tfStart = System.nanoTime();
+            String tail = "SET FOREIGN_KEY_CHECKS = 1;\n";
+            formatMs += (System.nanoTime() - tfStart) / 1_000_000L;
+
+            long twStart = System.nanoTime();
+            out.write(tail);
+            ioMs += (System.nanoTime() - twStart) / 1_000_000L;
         }
+        return new WriteTiming(formatMs, ioMs);
     }
 
     private String sanitizeFilename(String name) {
         return name.replaceAll("[^A-Za-z0-9_.-]+", "_");
+    }
+
+    private void writeTimingJsonReport(
+            String path,
+            List<TableTiming> timings,
+            long schemaMs,
+            long splitMs,
+            long compareMs,
+            long writeMs,
+            long writeFormatMs,
+            long writeIoMs,
+            long wallMs)
+            throws IOException {
+        List<TableTiming> sorted = new ArrayList<>(timings);
+        sorted.sort(Comparator.comparingLong(TableTiming::totalMs).reversed());
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("{\n");
+        sb.append("  \"schema_ms\": ").append(schemaMs).append(",\n");
+        sb.append("  \"split_ms\": ").append(splitMs).append(",\n");
+        sb.append("  \"compare_ms\": ").append(compareMs).append(",\n");
+        sb.append("  \"delete_ms\": ").append(0).append(",\n");
+        sb.append("  \"write_ms\": ").append(writeMs).append(",\n");
+        sb.append("  \"write_format_ms\": ").append(writeFormatMs).append(",\n");
+        sb.append("  \"write_io_ms\": ").append(writeIoMs).append(",\n");
+        sb.append("  \"total_ms\": ")
+                .append(schemaMs + splitMs + compareMs + writeMs)
+                .append(",\n");
+        sb.append("  \"wall_ms\": ").append(wallMs).append(",\n");
+        sb.append("  \"tables\": [\n");
+        for (int i = 0; i < sorted.size(); i++) {
+            TableTiming t = sorted.get(i);
+            sb.append("    {");
+            sb.append("\"table\": \"").append(t.tableName()).append("\", ");
+            sb.append("\"load_ms\": ").append(t.loadMs()).append(", ");
+            sb.append("\"compare_ms\": ").append(t.compareMs()).append(", ");
+            sb.append("\"delete_ms\": ").append(t.deleteMs()).append(", ");
+            sb.append("\"total_ms\": ").append(t.totalMs());
+            sb.append("}");
+            if (i < sorted.size() - 1) {
+                sb.append(",");
+            }
+            sb.append("\n");
+        }
+        sb.append("  ]\n");
+        sb.append("}\n");
+
+        Files.writeString(Path.of(path), sb.toString());
     }
 
     private void deleteDirectory(Path directory) throws IOException {

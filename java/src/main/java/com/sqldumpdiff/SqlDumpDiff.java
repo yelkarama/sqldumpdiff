@@ -61,27 +61,53 @@ public class SqlDumpDiff {
     }
 
     static void main(String[] args) {
-        // Parse debug flag first
+        Instant wallStart = Instant.now();
+        // Parse flags first (supports --debug, --timing, --timing-json in any order).
         boolean debug = false;
-        int argOffset = 0;
-        if (args.length > 0 && args[0].equals("--debug")) {
-            debug = true;
-            argOffset = 1;
+        boolean timing = false;
+        String timingJson = null;
+        java.util.List<String> positional = new java.util.ArrayList<>();
+
+        for (int i = 0; i < args.length; i++) {
+            String arg = args[i];
+            if ("--debug".equals(arg)) {
+                debug = true;
+                continue;
+            }
+            if ("--timing".equals(arg)) {
+                timing = true;
+                continue;
+            }
+            if (arg.startsWith("--timing-json")) {
+                if (arg.contains("=")) {
+                    timingJson = arg.substring(arg.indexOf('=') + 1);
+                } else if (i + 1 < args.length) {
+                    timingJson = args[++i];
+                }
+                continue;
+            }
+            positional.add(arg);
         }
 
         // Configure logging based on debug flag (before any logging happens)
         configureLogging(debug);
 
-        if (args.length < 2 + argOffset) {
-            System.err.println("Usage: sqldumpdiff [--debug] <old_dump.sql> <new_dump.sql> [output.sql]");
-            System.err.println("       --debug: Enable detailed console logging and disable progress bars");
-            System.err.println("       If output.sql is not provided, delta SQL is printed to stdout");
+        if (positional.size() < 2) {
+            System.err.println("Usage: sqldumpdiff [--debug] [--timing] [--timing-json <file>] <old_dump.sql> <new_dump.sql> [output.sql]");
+            System.err.println();
+            System.err.println("Options:");
+            System.err.println("  --debug        Enable detailed console logging and disable progress bars");
+            System.err.println("  --timing       Emit timing diagnostics even without --debug");
+            System.err.println("  --timing-json  Write timing report JSON to the given file");
+            System.err.println();
+            System.err.println("Notes:");
+            System.err.println("  If output.sql is not provided, delta SQL is printed to stdout");
             System.exit(1);
         }
 
-        String oldFile = args[argOffset];
-        String newFile = args[argOffset + 1];
-        String outputFile = args.length > argOffset + 2 ? args[argOffset + 2] : null;
+        String oldFile = positional.get(0);
+        String newFile = positional.get(1);
+        String outputFile = positional.size() > 2 ? positional.get(2) : null;
 
         try {
             Instant start = Instant.now();
@@ -93,7 +119,7 @@ public class SqlDumpDiff {
             }
 
             DeltaGenerator generator = new DeltaGenerator();
-            generator.generateDelta(oldFile, newFile, outputFile, debug);
+            generator.generateDelta(oldFile, newFile, outputFile, debug, timing, timingJson, start, wallStart);
 
             Duration duration = Duration.between(start, Instant.now());
             System.err.printf("\nCompleted in %d.%03ds\n",

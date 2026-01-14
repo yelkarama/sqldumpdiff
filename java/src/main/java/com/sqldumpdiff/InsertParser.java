@@ -196,12 +196,12 @@ public class InsertParser {
                 data.put(columns.get(i), values.get(i));
             }
 
-            String stmt = hasExplicitCols
-                    ? String.format("INSERT INTO `%s` (%s) VALUES %s;",
-                            table,
-                            columns.stream().map(c -> "`" + c + "`").reduce((a, b) -> a + ", " + b).orElse(""),
-                            group)
-                    : String.format("INSERT INTO `%s` VALUES %s;", table, group);
+            String colList = columns.stream()
+                    .map(c -> "`" + c + "`")
+                    .reduce((a, b) -> a + ", " + b)
+                    .orElse("");
+            // Always include columns, even when the original INSERT omitted them.
+            String stmt = String.format("INSERT INTO `%s` (%s) VALUES %s;", table, colList, group);
 
             results.add(new InsertRow(table, columns, data, stmt));
         }

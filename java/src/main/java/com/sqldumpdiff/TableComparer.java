@@ -21,19 +21,27 @@ import lombok.extern.java.Log;
 @Log
 public class TableComparer {
 
-    public ComparisonResult compare(TableComparison comparison) throws IOException, SQLException {
+    public TableCompareResult compare(TableComparison comparison) throws IOException, SQLException {
         if (comparison.pkColumns() == null) {
-            return new ComparisonResult(comparison.tableName(), "", "", 0, 0, 0);
+            return new TableCompareResult(
+                    new ComparisonResult(comparison.tableName(), "", "", 0, 0, 0),
+                    new TableTiming(comparison.tableName(), 0, 0, 0));
         }
 
         // Use SQLite instead of HashMap for memory efficiency
         SQLiteTableStore oldStore = new SQLiteTableStore(comparison.tableName(), comparison.pkColumns());
 
+        long loadMs = 0;
+        long compareMs = 0;
+        long deleteMs = 0;
+
         try {
             // Load old records into SQLite
             if (comparison.oldFile() != null && Files.exists(comparison.oldFile())) {
+                long start = System.nanoTime();
                 loadTableFileToSQLite(comparison.oldFile(), comparison.tableName(), oldStore);
                 oldStore.analyzeForQuery(); // Optimize query plan after loading
+                loadMs = (System.nanoTime() - start) / 1_000_000L;
 
                 long oldCount = oldStore.getRowCount();
                 if (oldCount == 0) {
@@ -51,6 +59,7 @@ public class TableComparer {
 
             // Process new rows
             if (comparison.newFile() != null && Files.exists(comparison.newFile())) {
+                long start = System.nanoTime();
                 try (BufferedReader reader = Files.newBufferedReader(comparison.newFile())) {
                     String line;
                     while ((line = reader.readLine()) != null) {
@@ -108,9 +117,11 @@ public class TableComparer {
                         }
                     }
                 }
+                compareMs = (System.nanoTime() - start) / 1_000_000L;
             }
 
             // Handle deletions: emit any old row hashes that were never matched
+            long deleteStart = System.nanoTime();
             Set<String> allOldHashes = oldStore.getAllPkHashes();
             for (String pkHash : allOldHashes) {
                 if (matchedOld.contains(pkHash)) {
@@ -126,14 +137,17 @@ public class TableComparer {
                 deletions.append(" WHERE ").append(whereClause).append(";\n\n");
                 deleteCount++;
             }
+            deleteMs = (System.nanoTime() - deleteStart) / 1_000_000L;
 
-            return new ComparisonResult(
+            ComparisonResult result = new ComparisonResult(
                     comparison.tableName(),
                     changes.toString(),
                     deletions.toString(),
                     insertCount,
                     updateCount,
                     deleteCount);
+            TableTiming timing = new TableTiming(comparison.tableName(), loadMs, compareMs, deleteMs);
+            return new TableCompareResult(result, timing);
         } finally {
             oldStore.close();
         }
