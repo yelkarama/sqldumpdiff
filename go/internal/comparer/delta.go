@@ -15,6 +15,8 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 
@@ -34,11 +36,34 @@ type ComparisonResult struct {
 	DeleteCount int
 }
 
+// TableTiming captures per-table timings for profiling.
+type TableTiming struct {
+	Table   string
+	LoadMS  int64
+	CompMS  int64
+	DelMS   int64
+}
+
+func (t TableTiming) TotalMS() int64 {
+	return t.LoadMS + t.CompMS + t.DelMS
+}
+
 // Summary holds aggregate counts for delta generation.
 type Summary struct {
 	InsertCount int
 	UpdateCount int
 	DeleteCount int
+}
+
+// TimingMeta captures overall timings and per-table timings for JSON reporting.
+type TimingMeta struct {
+	SplitMS   int64
+	CompareMS int64
+	DeleteMS  int64
+	WriteMS   int64
+	WriteFormatMS int64
+	WriteIOMS     int64
+	Tables    []*TableTiming
 }
 
 // SQLite tuning knobs (defaults are overridden by CLI profiles/flags).
@@ -47,6 +72,7 @@ var sqliteBatchSize = 20000
 var sqliteCacheKB = 800000
 var sqliteMmapMB = 128
 var sqliteWorkers = 0
+var timingEnabled = false
 
 // rowHash computes a deterministic hash of a row using column order.
 // We hash a canonical "col=value" sequence to quickly detect unchanged rows.
@@ -441,11 +467,13 @@ func insertRowsToSQLite(db *sql.DB, insertParser *parser.InsertParser, filename 
 // 1) load old rows into SQLite
 // 2) stream new rows and emit inserts/updates
 // 3) emit deletions for unseen PKs
-func compareTableSQLite(table string, pkCols []string, oldFilePath, newFilePath string) (*ComparisonResult, error) {
+func compareTableSQLite(table string, pkCols []string, oldFilePath, newFilePath string) (*ComparisonResult, *TableTiming, error) {
 	result := &ComparisonResult{TableName: table}
 	if oldFilePath == "" && newFilePath == "" {
-		return result, nil
+		return result, &TableTiming{Table: table}, nil
 	}
+
+	timing := &TableTiming{Table: table}
 
 	dbFile, err := os.CreateTemp("", "sqldumpdiff_table_*.db")
 	if err != nil {
@@ -471,8 +499,13 @@ func compareTableSQLite(table string, pkCols []string, oldFilePath, newFilePath 
 
 	// Load old rows into SQLite
 	if oldFilePath != "" {
+		start := time.Now()
 		if err := loadTableJSONL(db, oldFilePath, pkCols); err != nil {
-			return nil, err
+			return nil, nil, err
+		}
+		timing.LoadMS = time.Since(start).Milliseconds()
+		if timingEnabled || logger.IsDebugEnabled() {
+			logger.Debug("Timing: %s load old rows took %s", table, time.Since(start))
 		}
 	}
 
@@ -480,17 +513,27 @@ func compareTableSQLite(table string, pkCols []string, oldFilePath, newFilePath 
 
 	// Process new rows
 	if newFilePath != "" {
+		start := time.Now()
 		if err := compareNewRows(db, newFilePath, pkCols, result, seen); err != nil {
-			return nil, err
+			return nil, nil, err
+		}
+		timing.CompMS = time.Since(start).Milliseconds()
+		if timingEnabled || logger.IsDebugEnabled() {
+			logger.Debug("Timing: %s compare new rows took %s", table, time.Since(start))
 		}
 	}
 
 	// Deletions
+	start := time.Now()
 	if err := emitDeletionsFromDB(db, pkCols, seen, result); err != nil {
-		return nil, err
+		return nil, nil, err
+	}
+	timing.DelMS = time.Since(start).Milliseconds()
+	if timingEnabled || logger.IsDebugEnabled() {
+		logger.Debug("Timing: %s deletions step took %s", table, time.Since(start))
 	}
 
-	return result, nil
+	return result, timing, nil
 }
 
 // ConfigureSQLiteTunables allows CLI to override defaults.
@@ -508,6 +551,11 @@ func ConfigureSQLiteTunables(cacheKB, mmapMB, batchSize, workers int) {
 	if workers >= 0 {
 		sqliteWorkers = workers
 	}
+}
+
+// ConfigureTiming enables timing diagnostics independent of debug logging.
+func ConfigureTiming(enabled bool) {
+	timingEnabled = enabled
 }
 
 // DeltaGenerator generates delta SQL between two dumps
@@ -530,15 +578,16 @@ func NewDeltaGenerator(pkMap, oldColumnsMap, newColumnsMap map[string][]string) 
 // 1) split dumps into per-table JSONL files
 // 2) compare tables in parallel using per-table SQLite DBs
 // 3) stream SQL output and return summary counts
-func (dg *DeltaGenerator) GenerateDelta(oldFile, newFile string, p *mpb.Progress, out io.Writer) (Summary, error) {
+func (dg *DeltaGenerator) GenerateDelta(oldFile, newFile string, p *mpb.Progress, out io.Writer) (Summary, *TimingMeta, error) {
 	logger.Debug("GenerateDelta: Starting delta generation")
 	tmpDir, err := os.MkdirTemp("", "sqldumpdiff-sqlite-*")
 	if err != nil {
-		return Summary{}, fmt.Errorf("create temp dir: %w", err)
+		return Summary{}, nil, fmt.Errorf("create temp dir: %w", err)
 	}
 	defer os.RemoveAll(tmpDir)
 
 	summary := Summary{}
+	timingMeta := &TimingMeta{}
 
 	// Write header
 	fmt.Fprintln(out, "-- Full Delta Update Script")
@@ -547,6 +596,7 @@ func (dg *DeltaGenerator) GenerateDelta(oldFile, newFile string, p *mpb.Progress
 
 	// Split dumps into per-table JSONL files
 	logger.Debug("GenerateDelta: Splitting dumps by table")
+	splitStart := time.Now()
 	oldTableFiles := make(map[string]string)
 	newTableFiles := make(map[string]string)
 	var splitErr error
@@ -578,8 +628,12 @@ func (dg *DeltaGenerator) GenerateDelta(oldFile, newFile string, p *mpb.Progress
 	}()
 	wg.Wait()
 	if splitErr != nil {
-		return Summary{}, splitErr
+		return Summary{}, nil, splitErr
 	}
+	if timingEnabled || logger.IsDebugEnabled() {
+		logger.Debug("Timing: split dumps took %s", time.Since(splitStart))
+	}
+	timingMeta.SplitMS = time.Since(splitStart).Milliseconds()
 
 	// Compare per table in parallel
 	allTables := make(map[string]bool)
@@ -592,8 +646,12 @@ func (dg *DeltaGenerator) GenerateDelta(oldFile, newFile string, p *mpb.Progress
 	logger.Debug("GenerateDelta: old tables=%d new tables=%d all=%d pkMap=%d", len(oldTableFiles), len(newTableFiles), len(allTables), len(dg.pkMap))
 
 	logger.Debug("GenerateDelta: Comparing %d tables", len(allTables))
+	compareStart := time.Now()
 	var outMu sync.Mutex
 	var sumMu sync.Mutex
+	var writeMS int64
+	var writeFormatMS int64
+	var writeIOMS int64
 
 	maxWorkers := runtime.NumCPU()
 	if sqliteWorkers > 0 {
@@ -617,6 +675,8 @@ func (dg *DeltaGenerator) GenerateDelta(oldFile, newFile string, p *mpb.Progress
 	}
 
 	compareWg := sync.WaitGroup{}
+	var timingMu sync.Mutex
+	timings := make([]*TableTiming, 0, len(allTables))
 	for table := range allTables {
 		pkCols, hasPK := dg.pkMap[table]
 		if !hasPK {
@@ -629,21 +689,36 @@ func (dg *DeltaGenerator) GenerateDelta(oldFile, newFile string, p *mpb.Progress
 			defer compareWg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			res, err := compareTableSQLite(tbl, pk, oldFilePath, newFilePath)
+			res, timing, err := compareTableSQLite(tbl, pk, oldFilePath, newFilePath)
 			if err != nil {
 				logger.Error("GenerateDelta: Table %s compare error: %v", tbl, err)
 				return
 			}
+			if timing != nil {
+				timingMu.Lock()
+				timings = append(timings, timing)
+				timingMu.Unlock()
+			}
 			if res.Changes != "" || res.Deletions != "" {
-				outMu.Lock()
+				formatStart := time.Now()
+				var b strings.Builder
 				if res.Changes != "" {
-					fmt.Fprint(out, res.Changes)
+					b.WriteString(res.Changes)
 				}
 				if res.Deletions != "" {
-					fmt.Fprint(out, "-- DELETIONS\n")
-					fmt.Fprint(out, res.Deletions)
+					b.WriteString("-- DELETIONS\n")
+					b.WriteString(res.Deletions)
 				}
+				formatDur := time.Since(formatStart).Milliseconds()
+				atomic.AddInt64(&writeFormatMS, formatDur)
+
+				outMu.Lock()
+				ioStart := time.Now()
+				fmt.Fprint(out, b.String())
 				outMu.Unlock()
+				ioDur := time.Since(ioStart).Milliseconds()
+				atomic.AddInt64(&writeIOMS, ioDur)
+				atomic.AddInt64(&writeMS, formatDur+ioDur)
 			}
 			sumMu.Lock()
 			summary.InsertCount += res.InsertCount
@@ -659,10 +734,39 @@ func (dg *DeltaGenerator) GenerateDelta(oldFile, newFile string, p *mpb.Progress
 	if compareBar != nil {
 		compareBar.SetTotal(int64(len(allTables)), true)
 	}
+	if timingEnabled || logger.IsDebugEnabled() {
+		logger.Debug("Timing: compare tables took %s", time.Since(compareStart))
+	}
+	timingMeta.CompareMS = time.Since(compareStart).Milliseconds()
+
+	// Log top 10 slowest tables when debug logging is enabled.
+	if (timingEnabled || logger.IsDebugEnabled()) && len(timings) > 0 {
+		sort.Slice(timings, func(i, j int) bool {
+			return timings[i].TotalMS() > timings[j].TotalMS()
+		})
+		limit := 10
+		if len(timings) < limit {
+			limit = len(timings)
+		}
+		logger.Debug("Timing: top %d slowest tables (ms):", limit)
+		for i := 0; i < limit; i++ {
+			t := timings[i]
+			logger.Debug("  %s total=%d load=%d compare=%d delete=%d", t.Table, t.TotalMS(), t.LoadMS, t.CompMS, t.DelMS)
+		}
+	}
+	var deleteMS int64
+	for _, t := range timings {
+		deleteMS += t.DelMS
+	}
+	timingMeta.DeleteMS = deleteMS
+	timingMeta.WriteMS = atomic.LoadInt64(&writeMS)
+	timingMeta.WriteFormatMS = atomic.LoadInt64(&writeFormatMS)
+	timingMeta.WriteIOMS = atomic.LoadInt64(&writeIOMS)
 
 	fmt.Fprintln(out, "SET FOREIGN_KEY_CHECKS = 1;")
 	logger.Debug("GenerateDelta: Completed")
-	return summary, nil
+	timingMeta.Tables = timings
+	return summary, timingMeta, nil
 }
 
 func getColumnValueCaseInsensitive(row *parser.InsertRow, colName string) string {

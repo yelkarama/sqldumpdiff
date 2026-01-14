@@ -1,11 +1,14 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	"os"
+	"sort"
 	"strings"
+	"time"
 
 	"github.com/vbauerster/mpb/v8"
 	"github.com/younes/sqldumpdiff/internal/comparer"
@@ -57,6 +60,7 @@ func profileKeys(m map[string]sqliteProfile) []string {
 }
 
 func main() {
+	startWall := time.Now()
 	// Parse command line arguments.
 	// Each flag maps to a specific runtime tuning knob, and users can override
 	// the YAML profile defaults at the command line.
@@ -65,8 +69,14 @@ func main() {
 	sqliteMmapMB := flag.Int("sqlite-mmap-mb", 128, "SQLite mmap size in MB")
 	sqliteBatch := flag.Int("sqlite-batch", 20000, "SQLite insert batch size")
 	sqliteWorkers := flag.Int("sqlite-workers", 0, "Max concurrent table compares (0 = NumCPU)")
+	timing := flag.Bool("timing", false, "Emit timing diagnostics even without --debug")
+	timingJSON := flag.String("timing-json", "", "Write timing report JSON to file")
 	sqliteProfile := flag.String("sqlite-profile", "fast", "SQLite tuning profile: low-mem, balanced, fast")
 	sqliteProfileFile := flag.String("sqlite-profile-file", "sqlite_profiles.yaml", "SQLite profiles YAML file")
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: %s [--debug] [--timing] [--timing-json <file>] old_dump.sql new_dump.sql [delta.sql]\n", os.Args[0])
+		flag.PrintDefaults()
+	}
 	flag.Parse()
 
 	// Configure logging early so everything below can use logger.Debug/Info.
@@ -89,12 +99,12 @@ func main() {
 	comparer.ConfigureSQLiteTunables(profile.CacheKB, profile.MmapMB, profile.Batch, profile.Workers)
 
 	comparer.ConfigureSQLiteTunables(*sqliteCacheKB, *sqliteMmapMB, *sqliteBatch, *sqliteWorkers)
+	comparer.ConfigureTiming(*timing)
 
 	// Remaining arguments are positional: old file, new file, and optional output path.
 	args := flag.Args()
 	if len(args) < 2 {
-		fmt.Fprintf(os.Stderr, "Usage: %s [--debug] old_dump.sql new_dump.sql [delta.sql]\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "  If delta.sql is not specified, output goes to stdout\n")
+		flag.Usage()
 		os.Exit(1)
 	}
 
@@ -111,6 +121,7 @@ func main() {
 	logger.Debug("main: Delta file: %s", deltaFile)
 
 	// Parse schemas to get primary keys and columns (parallelized for speed).
+	startSchema := time.Now()
 	schemaParser := parser.NewSchemaParser()
 
 	// Create a single progress container for all concurrent progress bars.
@@ -177,6 +188,9 @@ func main() {
 		log.Fatalf("Error parsing new columns: %v", newColsRes.err)
 	}
 	newColsMap := newColsRes.cols
+	if *timing || logger.IsDebugEnabled() {
+		logger.Debug("Timing: schema/columns parsing took %s", time.Since(startSchema))
+	}
 
 	// Merge PK maps (prefer new file PKs if both have a PK definition).
 	for table, pk := range newPKMap {
@@ -197,7 +211,7 @@ func main() {
 		out = os.Stdout
 	}
 
-	summary, err := dg.GenerateDelta(oldFile, newFile, p, out)
+	summary, timingMeta, err := dg.GenerateDelta(oldFile, newFile, p, out)
 	if err != nil {
 		log.Fatalf("Error generating delta: %v", err)
 	}
@@ -214,5 +228,69 @@ func main() {
 	fmt.Printf("Total:    %d\n", summary.InsertCount+summary.UpdateCount+summary.DeleteCount)
 	fmt.Printf("%s\n", sep)
 
+	if *timing || logger.IsDebugEnabled() {
+		logger.Debug("Timing: total wall time %s", time.Since(startWall))
+	}
+
+	if *timingJSON != "" && timingMeta != nil {
+		writeTimingJSON(*timingJSON, time.Since(startSchema), time.Since(startWall), timingMeta)
+	}
+
 	logger.Debug("main: Delta generation complete")
+}
+
+type timingTable struct {
+	Table     string `json:"table"`
+	LoadMS    int64  `json:"load_ms"`
+	CompareMS int64  `json:"compare_ms"`
+	DeleteMS  int64  `json:"delete_ms"`
+	TotalMS   int64  `json:"total_ms"`
+}
+
+type timingReport struct {
+	SchemaMS  int64         `json:"schema_ms"`
+	SplitMS   int64         `json:"split_ms"`
+	CompareMS int64         `json:"compare_ms"`
+	DeleteMS  int64         `json:"delete_ms"`
+	WriteMS   int64         `json:"write_ms"`
+	WriteFormatMS int64     `json:"write_format_ms"`
+	WriteIOMS     int64     `json:"write_io_ms"`
+	TotalMS   int64         `json:"total_ms"`
+	WallMS    int64         `json:"wall_ms"`
+	Tables    []timingTable `json:"tables"`
+}
+
+func writeTimingJSON(path string, schemaDur, wallDur time.Duration, meta *comparer.TimingMeta) {
+	tables := make([]timingTable, 0, len(meta.Tables))
+	for _, t := range meta.Tables {
+		tables = append(tables, timingTable{
+			Table:     t.Table,
+			LoadMS:    t.LoadMS,
+			CompareMS: t.CompMS,
+			DeleteMS:  t.DelMS,
+			TotalMS:   t.TotalMS(),
+		})
+	}
+	sort.Slice(tables, func(i, j int) bool { return tables[i].TotalMS > tables[j].TotalMS })
+
+	report := timingReport{
+		SchemaMS:  schemaDur.Milliseconds(),
+		SplitMS:   meta.SplitMS,
+		CompareMS: meta.CompareMS,
+		DeleteMS:  meta.DeleteMS,
+		WriteMS:   meta.WriteMS,
+		WriteFormatMS: meta.WriteFormatMS,
+		WriteIOMS: meta.WriteIOMS,
+		TotalMS:   schemaDur.Milliseconds() + meta.SplitMS + meta.CompareMS + meta.DeleteMS + meta.WriteMS,
+		WallMS:    wallDur.Milliseconds(),
+		Tables:    tables,
+	}
+	b, err := json.MarshalIndent(report, "", "  ")
+	if err != nil {
+		logger.Error("Timing JSON marshal failed: %v", err)
+		return
+	}
+	if err := os.WriteFile(path, b, 0644); err != nil {
+		logger.Error("Timing JSON write failed: %v", err)
+	}
 }

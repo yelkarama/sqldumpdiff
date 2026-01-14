@@ -398,6 +398,15 @@ func (ip *InsertParser) ExpandInsert(insertStmt string, columnsMap map[string][]
 	if len(columns) == 0 {
 		if columnsMap != nil && len(columnsMap[table]) > 0 {
 			columns = columnsMap[table]
+		} else if columnsMap != nil {
+			// Case-insensitive fallback for table name mismatches.
+			lower := strings.ToLower(table)
+			for key, cols := range columnsMap {
+				if strings.ToLower(key) == lower {
+					columns = cols
+					break
+				}
+			}
 		}
 	}
 
