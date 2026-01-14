@@ -9,15 +9,14 @@ regex = "1.10"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"
-sha2 = "0.10"
+blake3 = "1.5"
 indicatif = "0.18"
 rayon = "1.10"
 rusqlite = { version = "0.38", features = ["bundled"] }
 tempfile = "3.10"
 hex = "0.4"
 num_cpus = "1.16"
-generic-array = "0.14.7"
-crypto-common = "0.1.7"
+ahash = "0.8"
 
 
 [profile.release]

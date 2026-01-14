@@ -6,8 +6,9 @@ use crate::parser::insert::InsertParser;
 use crate::parser::InsertRow;
 use rayon::prelude::*;
 use rusqlite::{params, Connection};
-use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use ahash::AHashSet;
+use blake3;
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
@@ -255,7 +256,7 @@ impl DeltaGenerator {
         let old_map = lock_or_err(&old_files, "read old table files")?.clone();
         let new_map = lock_or_err(&new_files, "read new table files")?.clone();
 
-        let mut all_tables: HashSet<String> = HashSet::new();
+        let mut all_tables: AHashSet<String> = AHashSet::new();
         for t in old_map.keys() {
             all_tables.insert(t.clone());
         }
@@ -448,8 +449,8 @@ fn split_dump_by_table(
 
     let mut writers: HashMap<String, BufWriter<File>> = HashMap::new();
     let mut table_paths: HashMap<String, String> = HashMap::new();
-    let mut missing_tables: HashSet<String> = HashSet::new();
-    let mut seen_tables: HashSet<String> = HashSet::new();
+    let mut missing_tables: AHashSet<String> = AHashSet::new();
+    let mut seen_tables: AHashSet<String> = AHashSet::new();
 
     let bar = progress.new_parse_bar(dump_file, progress_label);
 
@@ -535,10 +536,8 @@ fn sanitize_filename(name: &str) -> String {
     if out.is_empty() {
         out.push_str("table");
     }
-    let mut hasher = Sha256::new();
-    hasher.update(name.as_bytes());
-    let sum = hasher.finalize();
-    format!("{}_{}", out, hex::encode(&sum[..4]))
+    let sum = blake3::hash(name.as_bytes());
+    format!("{}_{}", out, hex::encode(&sum.as_bytes()[..4]))
 }
 
 // Compare a single table using a per-table SQLite database.
@@ -601,7 +600,7 @@ fn compare_table_sqlite(
         }
     }
 
-    let mut seen: HashSet<String> = HashSet::new();
+    let mut seen: AHashSet<String> = AHashSet::new();
 
     if !new_path.is_empty() {
         let compare_start = Instant::now();
@@ -643,7 +642,7 @@ fn load_table_jsonl(
     batch_size: usize,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let file = File::open(path)?;
-    let reader = BufReader::new(file);
+    let mut reader = BufReader::new(file);
 
     let mut tx = conn.transaction()?;
     let mut stmt = tx.prepare_cached(
@@ -651,9 +650,14 @@ fn load_table_jsonl(
     )?;
 
     let mut batch = 0usize;
+    let mut line = String::new();
 
-    for line in reader.lines() {
-        let line = line?;
+    loop {
+        line.clear();
+        let read = reader.read_line(&mut line)?;
+        if read == 0 {
+            break;
+        }
         if line.trim().is_empty() {
             continue;
         }
@@ -684,15 +688,20 @@ fn compare_new_rows(
     new_path: &str,
     pk_cols: &[String],
     result: &mut ComparisonResult,
-    seen: &mut HashSet<String>,
+    seen: &mut AHashSet<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let file = File::open(new_path)?;
-    let reader = BufReader::new(file);
+    let mut reader = BufReader::new(file);
 
     let mut stmt = conn.prepare("SELECT row_hash, row_json FROM rows WHERE pk_hash = ?1")?;
 
-    for line in reader.lines() {
-        let line = line?;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let read = reader.read_line(&mut line)?;
+        if read == 0 {
+            break;
+        }
         if line.trim().is_empty() {
             continue;
         }
@@ -743,7 +752,7 @@ fn emit_deletions(
     conn: &Connection,
     pk_cols: &[String],
     result: &mut ComparisonResult,
-    seen: &HashSet<String>,
+    seen: &AHashSet<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut stmt = conn.prepare("SELECT pk_hash, row_json FROM rows")?;
     let mut rows = stmt.query([])?;
@@ -804,29 +813,32 @@ fn setup_sqlite_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Erro
 
 // Compute row hash using column order.
 fn row_hash(row: &InsertRow) -> Vec<u8> {
-    let mut builder = String::new();
+    let mut hasher = blake3::Hasher::new();
     for col in &row.columns {
-        builder.push_str(&col.to_lowercase());
-        builder.push('=');
+        // Keep case-insensitive behavior while avoiding extra allocations when possible.
+        let lower = col.to_lowercase();
+        hasher.update(lower.as_bytes());
+        hasher.update(b"=");
         let val = get_column_value_ci(row, col);
-        builder.push_str(&normalize_null(&val));
-        builder.push(';');
+        let norm = normalize_null(&val);
+        hasher.update(norm.as_bytes());
+        hasher.update(b";");
     }
-    let mut hasher = Sha256::new();
-    hasher.update(builder.as_bytes());
-    hasher.finalize().to_vec()
+    hasher.finalize().as_bytes().to_vec()
 }
 
 // Hash PK values into a deterministic key.
 fn hash_pk(row: &InsertRow, pk_cols: &[String]) -> String {
-    let mut parts = Vec::new();
-    for col in pk_cols {
+    let mut hasher = blake3::Hasher::new();
+    for (idx, col) in pk_cols.iter().enumerate() {
+        if idx > 0 {
+            hasher.update(b"|");
+        }
         let val = get_column_value_ci(row, col);
-        parts.push(normalize_null(&val));
+        let norm = normalize_null(&val);
+        hasher.update(norm.as_bytes());
     }
-    let mut hasher = Sha256::new();
-    hasher.update(parts.join("|").as_bytes());
-    hex::encode(hasher.finalize())
+    hex::encode(hasher.finalize().as_bytes())
 }
 
 // Case-insensitive value lookup from row data.
