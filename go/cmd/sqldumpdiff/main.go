@@ -65,10 +65,6 @@ func main() {
 	// Each flag maps to a specific runtime tuning knob, and users can override
 	// the YAML profile defaults at the command line.
 	debug := flag.Bool("debug", false, "Enable debug logging")
-	sqliteCacheKB := flag.Int("sqlite-cache-kb", 800000, "SQLite cache size in KB (negative means KB)")
-	sqliteMmapMB := flag.Int("sqlite-mmap-mb", 128, "SQLite mmap size in MB")
-	sqliteBatch := flag.Int("sqlite-batch", 20000, "SQLite insert batch size")
-	sqliteWorkers := flag.Int("sqlite-workers", 0, "Max concurrent table compares (0 = NumCPU)")
 	timing := flag.Bool("timing", false, "Emit timing diagnostics even without --debug")
 	timingJSON := flag.String("timing-json", "", "Write timing report JSON to file")
 	sqliteProfile := flag.String("sqlite-profile", "fast", "SQLite tuning profile: low-mem, balanced, fast")
@@ -86,8 +82,7 @@ func main() {
 		logger.SetLogLevel(logger.InfoLevel)
 	}
 
-	// Load and apply the named profile from YAML, then override with per-flag values.
-	// This makes profiles the baseline but allows quick one-off tuning.
+	// Load and apply the named profile from YAML.
 	profiles, err := loadSQLiteProfiles(*sqliteProfileFile)
 	if err != nil {
 		log.Fatalf("Failed to load SQLite profiles: %v", err)
@@ -97,8 +92,6 @@ func main() {
 		log.Fatalf("Invalid --sqlite-profile value: %s (available: %v)", *sqliteProfile, profileKeys(profiles))
 	}
 	comparer.ConfigureSQLiteTunables(profile.CacheKB, profile.MmapMB, profile.Batch, profile.Workers)
-
-	comparer.ConfigureSQLiteTunables(*sqliteCacheKB, *sqliteMmapMB, *sqliteBatch, *sqliteWorkers)
 	comparer.ConfigureTiming(*timing)
 
 	// Remaining arguments are positional: old file, new file, and optional output path.
