@@ -10,6 +10,7 @@ import shutil
 import concurrent.futures
 import argparse
 import time
+import yaml
 from tqdm import tqdm
 
 # Wall-clock start time (module import time) for total runtime measurement.
@@ -590,7 +591,7 @@ def _process_insert_for_split(args):
     return expand_insert_statement(insert_stmt, cols_map)
 
 
-def split_dump_by_table(dump_file, columns_map, pk_map, tmpdir, label, show_progress=False):
+def split_dump_by_table(dump_file, columns_map, pk_map, tmpdir, label, show_progress=False, profile=None):
     """Split a dump into per-table JSONL files for parallel processing.
     Returns a dict: table_name -> jsonl path.
     """
@@ -621,7 +622,8 @@ def split_dump_by_table(dump_file, columns_map, pk_map, tmpdir, label, show_prog
             except ValueError:
                 insert_workers = os.cpu_count() or 4
         else:
-            insert_workers = os.cpu_count() or 4
+            prof_workers = (profile or {}).get("workers", 0)
+            insert_workers = prof_workers if prof_workers and prof_workers > 0 else (os.cpu_count() or 4)
         
         # Use processes for CPU-bound INSERT parsing (avoids GIL)
         executor_type = os.getenv("SQLDUMPDIFF_INSERT_EXECUTOR", "process").lower()
@@ -633,7 +635,9 @@ def split_dump_by_table(dump_file, columns_map, pk_map, tmpdir, label, show_prog
         with executor_class(max_workers=insert_workers) as executor:
             # Prepare args for process-based executor (needs to pass columns_map)
             args_list = [(stmt, columns_map) for stmt in insert_statements]
-            results_iter = executor.map(_process_insert_for_split, args_list)
+            chunk = (profile or {}).get("batch", 0)
+            chunksize = chunk if isinstance(chunk, int) and chunk > 0 else 1
+            results_iter = executor.map(_process_insert_for_split, args_list, chunksize=chunksize)
             if show_progress:
                 results_iter = tqdm(results_iter, total=len(insert_statements), desc=f"Splitting {label}", unit="inserts", file=sys.stderr)
             
@@ -710,7 +714,14 @@ def build_where_clause(pk_cols, data):
             where_parts.append(f"`{c}`='{safe_val}'")
     return " AND ".join(where_parts)
 
-def generate_delta(old_file, new_file, delta_out=None, debug=False, timing=False, timing_json=None):
+def load_sqlite_profiles(path):
+    with open(path, 'r', encoding='utf-8') as f:
+        data = yaml.safe_load(f) or {}
+    return data.get('profiles', {})
+
+
+def generate_delta(old_file, new_file, delta_out=None, debug=False, timing=False, timing_json=None,
+                   sqlite_profile="fast", sqlite_profile_file="sqlite_profiles.yaml"):
     """Generates a delta SQL script comparing two SQL dump files.
     
     Args:
@@ -740,6 +751,19 @@ def generate_delta(old_file, new_file, delta_out=None, debug=False, timing=False
     progress_stream = sys.stderr
     
     wall_start = _WALL_START
+    profiles = load_sqlite_profiles(sqlite_profile_file)
+    profile = profiles.get(sqlite_profile)
+    if profile is None:
+        raise ValueError(f"Invalid --sqlite-profile '{sqlite_profile}'")
+    if debug or timing:
+        # Python implementation does not use SQLite, so cache/mmap are informational only.
+        print(
+            f"[DEBUG] Using profile '{sqlite_profile}': "
+            f"cache_kb={profile.get('cache_kb')}, mmap_mb={profile.get('mmap_mb')}, "
+            f"batch={profile.get('batch')}, workers={profile.get('workers')}",
+            file=sys.stderr,
+        )
+
     print("Step 1: Mapping Schemas from DDL...", file=sys.stderr)
     schema_ms = 0
     split_ms = 0
@@ -772,8 +796,8 @@ def generate_delta(old_file, new_file, delta_out=None, debug=False, timing=False
             # Split old and new files in parallel using threads (I/O bound)
             t_split_start = time.monotonic()
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as split_executor:
-                old_future = split_executor.submit(split_dump_by_table, old_file, old_columns_map, pk_map, tmpdir, "old", not debug)
-                new_future = split_executor.submit(split_dump_by_table, new_file, new_columns_map, pk_map, tmpdir, "new", not debug)
+                old_future = split_executor.submit(split_dump_by_table, old_file, old_columns_map, pk_map, tmpdir, "old", not debug, profile)
+                new_future = split_executor.submit(split_dump_by_table, new_file, new_columns_map, pk_map, tmpdir, "new", not debug, profile)
                 old_table_files = old_future.result()
                 new_table_files = new_future.result()
             split_ms = int((time.monotonic() - t_split_start) * 1000)
@@ -810,9 +834,10 @@ def generate_delta(old_file, new_file, delta_out=None, debug=False, timing=False
                 except ValueError:
                     max_workers = None
 
-            # Defaults: if not specified, use CPU count
+            # Defaults: if not specified, use profile workers or CPU count
             if max_workers is None:
-                max_workers = cpu_count
+                prof_workers = profile.get("workers", 0)
+                max_workers = prof_workers if prof_workers and prof_workers > 0 else cpu_count
 
             # Oversubscription is allowed by default, but capped
             if parallel and hard_cap and max_workers > hard_cap:
@@ -1000,6 +1025,8 @@ if __name__ == "__main__":
     parser.add_argument("new_dump", help="New SQL dump file")
     parser.add_argument("output", nargs="?", default=None, help="Output delta SQL (optional)")
     parser.add_argument("--timing-json", dest="timing_json", default=None, help="Write timing report JSON to file")
+    parser.add_argument("--sqlite-profile", dest="sqlite_profile", default="fast", help="SQLite profile name (low-mem, balanced, fast)")
+    parser.add_argument("--sqlite-profile-file", dest="sqlite_profile_file", default="sqlite_profiles.yaml", help="SQLite profiles YAML file")
     if len(sys.argv) == 1:
         parser.print_help()
         sys.exit(1)
@@ -1012,6 +1039,8 @@ if __name__ == "__main__":
         debug=args.debug,
         timing=args.timing,
         timing_json=args.timing_json,
+        sqlite_profile=args.sqlite_profile,
+        sqlite_profile_file=args.sqlite_profile_file,
     )
     if args.output:
         print(f"\nDelta script written to: {args.output}", file=sys.stderr)

@@ -1,0 +1,16 @@
+profiles:
+  low-mem:
+    cache_kb: 200000
+    mmap_mb: 64
+    batch: 10000
+    workers: 4
+  balanced:
+    cache_kb: 400000
+    mmap_mb: 128
+    batch: 15000
+    workers: 0
+  fast:
+    cache_kb: 800000
+    mmap_mb: 128
+    batch: 20000
+    workers: 0
