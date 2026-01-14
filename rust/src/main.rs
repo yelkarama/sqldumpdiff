@@ -9,6 +9,7 @@ mod progress;
 
 use clap::{CommandFactory, Parser};
 use serde_json;
+use serde_yaml;
 use comparer::{DeltaGenerator, SqliteTunables};
 use parser::schema::SchemaParser;
 use std::fs::File;
@@ -25,21 +26,13 @@ struct Args {
     #[arg(long)]
     debug: bool,
 
-    /// SQLite cache size in KB (negative = KB).
-    #[arg(long, default_value_t = 800_000)]
-    sqlite_cache_kb: i64,
+    /// SQLite tuning profile name (low-mem, balanced, fast).
+    #[arg(long, default_value = "fast")]
+    sqlite_profile: String,
 
-    /// SQLite mmap size in MB.
-    #[arg(long, default_value_t = 128)]
-    sqlite_mmap_mb: i64,
-
-    /// SQLite insert batch size.
-    #[arg(long, default_value_t = 20_000)]
-    sqlite_batch: usize,
-
-    /// Max concurrent table compares (0 = num CPU).
-    #[arg(long, default_value_t = 0)]
-    sqlite_workers: usize,
+    /// SQLite profiles YAML file.
+    #[arg(long, default_value = "sqlite_profiles.yaml")]
+    sqlite_profile_file: String,
 
     /// Emit timing diagnostics even without --debug.
     #[arg(long, default_value_t = false)]
@@ -57,6 +50,19 @@ struct Args {
     /// Write timing report JSON to file.
     #[arg(long)]
     timing_json: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct SqliteProfilesFile {
+    profiles: std::collections::HashMap<String, SqliteProfile>,
+}
+
+#[derive(Debug, serde::Deserialize, Clone)]
+struct SqliteProfile {
+    cache_kb: i64,
+    mmap_mb: i64,
+    batch: usize,
+    workers: usize,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -140,11 +146,23 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         old_pk.insert(table, pk);
     }
 
+    // Load SQLite profiles from YAML and apply the selected profile first.
+    let profiles: SqliteProfilesFile = {
+        let yaml = std::fs::read_to_string(&args.sqlite_profile_file)?;
+        serde_yaml::from_str(&yaml)?
+    };
+    let profile = profiles
+        .profiles
+        .get(&args.sqlite_profile)
+        .cloned()
+        .ok_or_else(|| format!("Invalid --sqlite-profile '{}'", args.sqlite_profile))?;
+
+    // Apply profile defaults.
     let tunables = SqliteTunables {
-        cache_kb: args.sqlite_cache_kb,
-        mmap_mb: args.sqlite_mmap_mb,
-        batch_size: args.sqlite_batch,
-        workers: args.sqlite_workers,
+        cache_kb: profile.cache_kb,
+        mmap_mb: profile.mmap_mb,
+        batch_size: profile.batch,
+        workers: profile.workers,
     };
 
     let generator = DeltaGenerator::new(old_pk, old_cols, new_cols, tunables, args.timing);
