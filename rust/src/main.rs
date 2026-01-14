@@ -215,12 +215,3 @@ fn basename(path: &str) -> String {
         .unwrap_or(path)
         .to_string()
 }
-
-// Lock helper for consistent error handling with `?`.
-fn lock_or_err<'a, T>(
-    m: &'a Mutex<T>,
-    ctx: &str,
-) -> Result<MutexGuard<'a, T>, Box<dyn std::error::Error + Send + Sync>> {
-    m.lock()
-        .map_err(|_| format!("{}: mutex poisoned", ctx).into())
-}
