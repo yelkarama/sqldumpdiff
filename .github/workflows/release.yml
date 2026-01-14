@@ -97,6 +97,7 @@ jobs:
         with:
           java-version: "25"
           distribution: "graalvm"
+          components: "native-image"
       - name: Build native image
         run: |
           cd java
@@ -108,6 +109,29 @@ jobs:
         with:
           name: java-native-linux
           path: java/dist/sqldumpdiff-linux-native
+
+  java-native-windows:
+    name: Java Native (windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: graalvm/setup-graalvm@v1
+        with:
+          java-version: "25"
+          distribution: "graalvm"
+          components: "native-image"
+      - name: Build native image
+        shell: bash
+        run: |
+          cd java
+          mvn -q -Pnative -DskipTests -Dnative-image.args="-H:+UnlockExperimentalVMOptions --gc=G1" package
+          mkdir -p dist
+          cp target/sqldumpdiff.exe dist/sqldumpdiff-windows-native.exe
+      - name: Upload native artifact (windows)
+        uses: actions/upload-artifact@v4
+        with:
+          name: java-native-windows
+          path: java/dist/sqldumpdiff-windows-native.exe
 
   python-pypi:
     name: Python (PyPI)
@@ -134,7 +158,7 @@ jobs:
   release:
     name: Publish Release
     runs-on: ubuntu-latest
-    needs: [go-build, java-build, java-native-linux, python-pypi]
+    needs: [go-build, java-build, java-native-linux, java-native-windows, python-pypi]
     steps:
       - uses: actions/checkout@v4
       - name: Download artifacts
