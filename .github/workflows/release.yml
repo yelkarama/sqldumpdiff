@@ -49,7 +49,7 @@ jobs:
           if [[ "${{ matrix.os }}" == "windows" ]]; then
             OUT="${OUT}.exe"
           fi
-          GOOS="${{ matrix.os }}" GOARCH="${{ matrix.arch }}" go build -o "$OUT" ./cmd/sqldumpdiff
+          GOOS="${{ matrix.os }}" GOARCH="${{ matrix.arch }}" go build -ldflags="-s -w" -o "$OUT" ./cmd/sqldumpdiff
           mkdir -p dist
           cp "$OUT" "dist/${OUT}"
       - name: Upload artifact
