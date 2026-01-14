@@ -100,7 +100,7 @@ jobs:
       - name: Build native image
         run: |
           cd java
-          mvn -q -Pnative -DskipTests -Dnative-image.args="--gc=G1" package
+          mvn -q -Pnative -DskipTests -Dnative-image.args="-H:+UnlockExperimentalVMOptions --gc=G1" package
           mkdir -p dist
           cp target/sqldumpdiff dist/sqldumpdiff-linux-native
       - name: Upload native artifact (linux)
@@ -123,7 +123,7 @@ jobs:
         shell: bash
         run: |
           cd java
-          mvn -q -Pnative -DskipTests -Dnative-image.args="--gc=G1" package
+          mvn -q -Pnative -DskipTests -Dnative-image.args="-H:+UnlockExperimentalVMOptions --gc=G1" package
           mkdir -p dist
           cp target/sqldumpdiff.exe dist/sqldumpdiff-windows-native.exe
       - name: Upload native artifact (windows)
