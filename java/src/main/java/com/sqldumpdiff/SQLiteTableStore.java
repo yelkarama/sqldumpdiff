@@ -31,7 +31,7 @@ public class SQLiteTableStore {
     private PreparedStatement selectStmt;
     private PreparedStatement deleteStmt;
 
-    public SQLiteTableStore(String table, List<String> pkColumns) throws SQLException, IOException {
+    public SQLiteTableStore(String table, List<String> pkColumns, SqliteProfile profile) throws SQLException, IOException {
         this.tableName = table;
         this.pkColumns = pkColumns;
         this.dbFile = Files.createTempFile("sqldumpdiff_", ".db");
@@ -44,11 +44,13 @@ public class SQLiteTableStore {
         try (Statement stmt = connection.createStatement()) {
             stmt.execute("PRAGMA journal_mode=OFF");
             stmt.execute("PRAGMA synchronous=OFF");
-            stmt.execute("PRAGMA cache_size=-600000"); // ~600MB cache if available
-            stmt.execute("PRAGMA page_size=32768"); // Bigger pages reduce I/O
             stmt.execute("PRAGMA temp_store=MEMORY");
-            stmt.execute("PRAGMA mmap_size=134217728"); // 128MB mmap window
+            stmt.execute("PRAGMA page_size=32768");
             stmt.execute("PRAGMA busy_timeout=5000");
+            int cacheKb = profile != null ? profile.cache_kb() : 600000;
+            int mmapMb = profile != null ? profile.mmap_mb() : 128;
+            stmt.execute("PRAGMA cache_size=-" + cacheKb);
+            stmt.execute("PRAGMA mmap_size=" + (mmapMb * 1024L * 1024L));
         }
 
         // Now switch to manual commits for batched inserts

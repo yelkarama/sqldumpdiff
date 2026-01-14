@@ -32,7 +32,7 @@ import me.tongfei.progressbar.ProgressBar;
 @Log
 public class DeltaGenerator {
 
-    public void generateDelta(String oldFilePath, String newFilePath, String outputPath, boolean debug, boolean timing, String timingJsonPath, Instant startTime, Instant wallStart)
+    public void generateDelta(String oldFilePath, String newFilePath, String outputPath, boolean debug, boolean timing, String timingJsonPath, Instant startTime, Instant wallStart, SqliteProfile profile)
             throws IOException, InterruptedException, ExecutionException {
 
         Path oldFile = Path.of(oldFilePath);
@@ -137,11 +137,21 @@ public class DeltaGenerator {
                 try (ProgressBar pb = pbFactory.create("Comparing tables", comparisons.size());
                         ExecutorService compareExecutor = Executors.newVirtualThreadPerTaskExecutor()) {
 
+                    int maxWorkers = profile != null && profile.workers() > 0
+                            ? profile.workers()
+                            : Runtime.getRuntime().availableProcessors();
+                    java.util.concurrent.Semaphore sem = new java.util.concurrent.Semaphore(maxWorkers);
+
                     List<Future<TableCompareResult>> futures = comparisons.stream()
                             .map(comp -> compareExecutor.submit(() -> {
-                                TableCompareResult result = compareTable(comp);
-                                pb.step();
-                                return result;
+                                sem.acquire();
+                                try {
+                                    TableCompareResult result = compareTable(comp, profile);
+                                    pb.step();
+                                    return result;
+                                } finally {
+                                    sem.release();
+                                }
                             }))
                             .toList();
 
@@ -286,9 +296,9 @@ public class DeltaGenerator {
         return tablePaths;
     }
 
-    private TableCompareResult compareTable(TableComparison comparison) {
+    private TableCompareResult compareTable(TableComparison comparison, SqliteProfile profile) {
         try {
-            TableComparer comparer = new TableComparer();
+            TableComparer comparer = new TableComparer(profile);
             TableCompareResult result = comparer.compare(comparison);
 
             // Log detailed comparison results

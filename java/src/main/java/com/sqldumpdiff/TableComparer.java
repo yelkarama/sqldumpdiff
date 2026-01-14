@@ -20,6 +20,11 @@ import lombok.extern.java.Log;
  */
 @Log
 public class TableComparer {
+    private final SqliteProfile profile;
+
+    public TableComparer(SqliteProfile profile) {
+        this.profile = profile;
+    }
 
     public TableCompareResult compare(TableComparison comparison) throws IOException, SQLException {
         if (comparison.pkColumns() == null) {
@@ -29,7 +34,7 @@ public class TableComparer {
         }
 
         // Use SQLite instead of HashMap for memory efficiency
-        SQLiteTableStore oldStore = new SQLiteTableStore(comparison.tableName(), comparison.pkColumns());
+        SQLiteTableStore oldStore = new SQLiteTableStore(comparison.tableName(), comparison.pkColumns(), profile);
 
         long loadMs = 0;
         long compareMs = 0;
@@ -168,8 +173,9 @@ public class TableComparer {
                 InsertRow row = InsertRow.fromJson(line, table);
                 store.insertRow(row);
 
-                // Execute batch every 1k rows for better memory management
-                if (++batch % 1000 == 0) {
+                int batchSize = profile != null ? profile.batch() : 1000;
+                // Execute batch every N rows for better memory management
+                if (++batch % batchSize == 0) {
                     store.executeBatch();
                 }
             }

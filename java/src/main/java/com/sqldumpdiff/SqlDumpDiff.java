@@ -62,10 +62,12 @@ public class SqlDumpDiff {
 
     static void main(String[] args) {
         Instant wallStart = Instant.now();
-        // Parse flags first (supports --debug, --timing, --timing-json in any order).
+        // Parse flags first (supports --debug, --timing, --timing-json, --sqlite-profile, --sqlite-profile-file).
         boolean debug = false;
         boolean timing = false;
         String timingJson = null;
+        String sqliteProfile = "fast";
+        String sqliteProfileFile = "sqlite_profiles.yaml";
         java.util.List<String> positional = new java.util.ArrayList<>();
 
         for (int i = 0; i < args.length; i++) {
@@ -86,6 +88,22 @@ public class SqlDumpDiff {
                 }
                 continue;
             }
+            if (arg.startsWith("--sqlite-profile")) {
+                if (arg.contains("=")) {
+                    sqliteProfile = arg.substring(arg.indexOf('=') + 1);
+                } else if (i + 1 < args.length) {
+                    sqliteProfile = args[++i];
+                }
+                continue;
+            }
+            if (arg.startsWith("--sqlite-profile-file")) {
+                if (arg.contains("=")) {
+                    sqliteProfileFile = arg.substring(arg.indexOf('=') + 1);
+                } else if (i + 1 < args.length) {
+                    sqliteProfileFile = args[++i];
+                }
+                continue;
+            }
             positional.add(arg);
         }
 
@@ -99,6 +117,8 @@ public class SqlDumpDiff {
             System.err.println("  --debug        Enable detailed console logging and disable progress bars");
             System.err.println("  --timing       Emit timing diagnostics even without --debug");
             System.err.println("  --timing-json  Write timing report JSON to the given file");
+            System.err.println("  --sqlite-profile       SQLite profile name (low-mem, balanced, fast)");
+            System.err.println("  --sqlite-profile-file  SQLite profiles YAML file");
             System.err.println();
             System.err.println("Notes:");
             System.err.println("  If output.sql is not provided, delta SQL is printed to stdout");
@@ -119,7 +139,12 @@ public class SqlDumpDiff {
             }
 
             DeltaGenerator generator = new DeltaGenerator();
-            generator.generateDelta(oldFile, newFile, outputFile, debug, timing, timingJson, start, wallStart);
+            SqliteProfilesFile profiles = SqliteProfileLoader.load(java.nio.file.Path.of(sqliteProfileFile));
+            SqliteProfile profile = profiles != null ? profiles.profiles().get(sqliteProfile) : null;
+            if (profile == null) {
+                throw new IllegalArgumentException("Invalid --sqlite-profile: " + sqliteProfile);
+            }
+            generator.generateDelta(oldFile, newFile, outputFile, debug, timing, timingJson, start, wallStart, profile);
 
             Duration duration = Duration.between(start, Instant.now());
             System.err.printf("\nCompleted in %d.%03ds\n",
