@@ -95,12 +95,12 @@ jobs:
       - uses: graalvm/setup-graalvm@v1
         with:
           java-version: "25"
-          distribution: "graalvm-community"
+          distribution: "graalvm"
           components: "native-image"
       - name: Build native image
         run: |
           cd java
-          mvn -q -Pnative -DskipTests package
+          mvn -q -Pnative -DskipTests -Dnative-image.args="--gc=G1" package
           mkdir -p dist
           cp target/sqldumpdiff dist/sqldumpdiff-linux-native
       - name: Upload native artifact (linux)
@@ -117,13 +117,13 @@ jobs:
       - uses: graalvm/setup-graalvm@v1
         with:
           java-version: "25"
-          distribution: "graalvm-community"
+          distribution: "graalvm"
           components: "native-image"
       - name: Build native image
         shell: bash
         run: |
           cd java
-          mvn -q -Pnative -DskipTests package
+          mvn -q -Pnative -DskipTests -Dnative-image.args="--gc=G1" package
           mkdir -p dist
           cp target/sqldumpdiff.exe dist/sqldumpdiff-windows-native.exe
       - name: Upload native artifact (windows)
@@ -135,7 +135,7 @@ jobs:
   release:
     name: Publish Release
     runs-on: ubuntu-latest
-    needs: [go-build, java-build, java-native-linux, java-native-windows]
+    needs: [go-build, java-build, java-native-linux]
     steps:
       - uses: actions/checkout@v4
       - name: Download artifacts
