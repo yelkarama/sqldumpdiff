@@ -477,7 +477,7 @@ func compareTableSQLite(table string, pkCols []string, oldFilePath, newFilePath 
 
 	dbFile, err := os.CreateTemp("", "sqldumpdiff_table_*.db")
 	if err != nil {
-		return nil, fmt.Errorf("create temp db: %w", err)
+		return nil, nil, fmt.Errorf("create temp db: %w", err)
 	}
 	dbPath := dbFile.Name()
 	dbFile.Close()
@@ -487,14 +487,14 @@ func compareTableSQLite(table string, pkCols []string, oldFilePath, newFilePath 
 
 	db, err := sql.Open("sqlite3", dbPath)
 	if err != nil {
-		return nil, fmt.Errorf("open sqlite: %w", err)
+		return nil, nil, fmt.Errorf("open sqlite: %w", err)
 	}
 	defer db.Close()
 	if err := applySQLitePragmas(db); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if err := setupSQLiteSchema(db); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// Load old rows into SQLite
