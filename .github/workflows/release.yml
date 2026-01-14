@@ -20,17 +20,11 @@ jobs:
           - os: linux
             arch: amd64
             runner: ubuntu-latest
-          - os: linux
-            arch: arm64
-            runner: ubuntu-latest
           - os: darwin
             arch: arm64
             runner: macos-14
           - os: windows
             arch: amd64
-            runner: windows-latest
-          - os: windows
-            arch: arm64
             runner: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -46,32 +40,15 @@ jobs:
           install: >-
             mingw-w64-ucrt-x86_64-gcc
             mingw-w64-ucrt-x86_64-pkgconf
-      - name: Setup MSYS2 (windows arm64)
-        if: matrix.os == 'windows' && matrix.arch == 'arm64'
-        uses: msys2/setup-msys2@v2
-        with:
-          msystem: CLANGARM64
-          path-type: inherit
-          install: >-
-            mingw-w64-clang-aarch64-gcc
-            mingw-w64-clang-aarch64-pkgconf
-      - name: Build (non-windows)
-        if: matrix.os != 'windows'
-        shell: bash
+      - name: Build
+        shell: ${{ matrix.os == 'windows' && 'msys2 {0}' || 'bash' }}
         run: |
           set -euo pipefail
           cd go
           OUT="sqldumpdiff-${{ matrix.os }}-${{ matrix.arch }}"
-          GOOS="${{ matrix.os }}" GOARCH="${{ matrix.arch }}" go build -o "$OUT" ./cmd/sqldumpdiff
-          mkdir -p dist
-          cp "$OUT" "dist/${OUT}"
-      - name: Build (windows)
-        if: matrix.os == 'windows'
-        shell: msys2 {0}
-        run: |
-          set -euo pipefail
-          cd go
-          OUT="sqldumpdiff-${{ matrix.os }}-${{ matrix.arch }}.exe"
+          if [[ "${{ matrix.os }}" == "windows" ]]; then
+            OUT="${OUT}.exe"
+          fi
           GOOS="${{ matrix.os }}" GOARCH="${{ matrix.arch }}" go build -o "$OUT" ./cmd/sqldumpdiff
           mkdir -p dist
           cp "$OUT" "dist/${OUT}"
