@@ -30,7 +30,7 @@ Thumbs.db
 # Output files
 full_delta_update.sql
 
-*.sql
+# *.sql
 *.log
 *.tmp
 *.bak
