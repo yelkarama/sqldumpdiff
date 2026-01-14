@@ -1,0 +1,24 @@
+[package]
+name = "sqldumpdiff"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+regex = "1.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+indicatif = "0.17"
+rayon = "1.10"
+rusqlite = { version = "0.31", features = ["bundled"] }
+tempfile = "3.10"
+hex = "0.4"
+num_cpus = "1.16"
+
+[profile.release]
+# Favor speed; strip symbols in release builds.
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"

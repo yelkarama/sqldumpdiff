@@ -51,3 +51,4 @@ full_delta_update.sql
 *.xz
 *.egg-info/
 go/sqldumpdiff
+rust/target
