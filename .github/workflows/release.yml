@@ -155,10 +155,49 @@ jobs:
           packages-dir: python/dist
           skip-existing: true
 
+  rust-build:
+    name: Rust (${{ matrix.os }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            runner: ubuntu-latest
+            artifact: sqldumpdiff-rust-linux-amd64
+          - os: windows
+            runner: windows-latest
+            artifact: sqldumpdiff-rust-windows-amd64.exe
+          - os: darwin
+            runner: macos-14
+            artifact: sqldumpdiff-rust-macos-arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+      - name: Build
+        shell: bash
+        run: |
+          cd rust
+          cargo build --release
+          mkdir -p dist
+          if [[ "${{ matrix.os }}" == "windows" ]]; then
+            cp target/release/sqldumpdiff.exe dist/${{ matrix.artifact }}
+          else
+            cp target/release/sqldumpdiff dist/${{ matrix.artifact }}
+          fi
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-${{ matrix.os }}
+          path: rust/dist/*
+
   release:
     name: Publish Release
     runs-on: ubuntu-latest
-    needs: [go-build, java-build, java-native-linux, java-native-windows, python-pypi]
+    needs: [go-build, java-build, java-native-linux, java-native-windows, python-pypi, rust-build]
     steps:
       - uses: actions/checkout@v4
       - name: Download artifacts
