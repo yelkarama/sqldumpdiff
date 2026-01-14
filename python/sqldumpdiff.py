@@ -8,7 +8,12 @@ import tempfile
 import subprocess
 import shutil
 import concurrent.futures
+import argparse
+import time
 from tqdm import tqdm
+
+# Wall-clock start time (module import time) for total runtime measurement.
+_WALL_START = time.monotonic()
 
 # Increase CSV field size limit to handle large TEXT/BLOB fields
 # Default limit is 131072 (128KB), increase to handle large fields
@@ -491,6 +496,7 @@ def _load_table_file(path):
 def _process_table(args):
     """Worker to compute delta for a single table. Designed to be picklable for multiprocessing."""
     table, pk_cols, old_path, new_path = args
+    t_load_start = time.monotonic()
 
     old_records = {}
     # Load old rows
@@ -498,6 +504,7 @@ def _process_table(args):
         data = entry.get('data', {})
         pk_values = tuple(data.get(c) for c in pk_cols)
         old_records[pk_values] = entry
+    load_ms = int((time.monotonic() - t_load_start) * 1000)
 
     changes_lines = []
     deletion_lines = []
@@ -507,6 +514,7 @@ def _process_table(args):
     delete_count = 0
 
     # Process new rows
+    t_compare_start = time.monotonic()
     for entry in _load_table_file(new_path):
         data = entry.get('data', {})
         cols = entry.get('columns', [])
@@ -541,7 +549,10 @@ def _process_table(args):
             changes_lines.append(f"UPDATE `{table}` SET {', '.join(updates)} WHERE {where_str};\n\n")
             update_count += 1
 
+    compare_ms = int((time.monotonic() - t_compare_start) * 1000)
+
     # Handle deletions
+    t_delete_start = time.monotonic()
     for pk_values, old_entry in old_records.items():
         if pk_values in matched_old:
             continue
@@ -550,6 +561,7 @@ def _process_table(args):
         deletion_lines.append(f"-- DELETED FROM {table}: {pk_values}\n")
         deletion_lines.append(f"DELETE FROM `{table}` WHERE {where_str};\n\n")
         delete_count += 1
+    delete_ms = int((time.monotonic() - t_delete_start) * 1000)
 
     return {
         'table': table,
@@ -558,6 +570,12 @@ def _process_table(args):
         'insert_count': insert_count,
         'update_count': update_count,
         'delete_count': delete_count,
+        'timing': {
+            'load_ms': load_ms,
+            'compare_ms': compare_ms,
+            'delete_ms': delete_ms,
+            'total_ms': load_ms + compare_ms + delete_ms,
+        },
     }
 
 
@@ -692,7 +710,7 @@ def build_where_clause(pk_cols, data):
             where_parts.append(f"`{c}`='{safe_val}'")
     return " AND ".join(where_parts)
 
-def generate_delta(old_file, new_file, delta_out=None):
+def generate_delta(old_file, new_file, delta_out=None, debug=False, timing=False, timing_json=None):
     """Generates a delta SQL script comparing two SQL dump files.
     
     Args:
@@ -721,14 +739,26 @@ def generate_delta(old_file, new_file, delta_out=None):
     # Always send progress messages to stderr so they don't interfere with stdout
     progress_stream = sys.stderr
     
+    wall_start = _WALL_START
     print("Step 1: Mapping Schemas from DDL...", file=sys.stderr)
+    schema_ms = 0
+    split_ms = 0
+    compare_ms = 0
+    delete_ms = 0
+    write_ms = 0
+    write_format_ms = 0
+    write_io_ms = 0
+    t_schema_start = time.monotonic()
     try:
-        pk_map = get_table_schemas(new_file, show_progress=True)
+        pk_map = get_table_schemas(new_file, show_progress=not debug)
         # Column maps for parsing INSERTs without column lists
-        new_columns_map = get_table_columns(new_file, show_progress=False)
-        old_columns_map = get_table_columns(old_file, show_progress=False)
+        new_columns_map = get_table_columns(new_file, show_progress=not debug)
+        old_columns_map = get_table_columns(old_file, show_progress=not debug)
     except Exception as e:
         raise RuntimeError(f"Error parsing schema: {e}") from e
+    schema_ms = int((time.monotonic() - t_schema_start) * 1000)
+    if debug or timing:
+        print(f"[DEBUG] Timing: schema/columns parsing took {schema_ms}ms", file=sys.stderr)
     
     if not pk_map:
         print("Warning: No tables with PRIMARY KEY found in new file schema.", file=sys.stderr)
@@ -740,11 +770,15 @@ def generate_delta(old_file, new_file, delta_out=None):
     try:
         with tempfile.TemporaryDirectory(prefix="sqldumpdiff_") as tmpdir:
             # Split old and new files in parallel using threads (I/O bound)
+            t_split_start = time.monotonic()
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as split_executor:
-                old_future = split_executor.submit(split_dump_by_table, old_file, old_columns_map, pk_map, tmpdir, "old", True)
-                new_future = split_executor.submit(split_dump_by_table, new_file, new_columns_map, pk_map, tmpdir, "new", True)
+                old_future = split_executor.submit(split_dump_by_table, old_file, old_columns_map, pk_map, tmpdir, "old", not debug)
+                new_future = split_executor.submit(split_dump_by_table, new_file, new_columns_map, pk_map, tmpdir, "new", not debug)
                 old_table_files = old_future.result()
                 new_table_files = new_future.result()
+            split_ms = int((time.monotonic() - t_split_start) * 1000)
+                if debug or timing:
+                    print(f"[DEBUG] Timing: split dumps took {split_ms}ms", file=sys.stderr)
 
             tables_to_process = sorted(set(old_table_files.keys()) | set(new_table_files.keys()))
             if not tables_to_process:
@@ -812,14 +846,22 @@ def generate_delta(old_file, new_file, delta_out=None):
                 
                 with executor_class(max_workers=max_workers) as executor:
                     future_to_table = {executor.submit(_process_table, arg): arg[0] for arg in worker_args}
-                    for future in tqdm(concurrent.futures.as_completed(future_to_table), total=len(future_to_table), desc="Processing tables", unit="table", file=progress_stream):
+                    t_compare_start = time.monotonic()
+                    for future in tqdm(concurrent.futures.as_completed(future_to_table), total=len(future_to_table), desc="Processing tables", unit="table", file=progress_stream, disable=debug):
                         try:
                             results.append(future.result())
                         except Exception as e:
                             print(f"Error processing table {future_to_table[future]}: {e}", file=sys.stderr)
+                    compare_ms = int((time.monotonic() - t_compare_start) * 1000)
+                    if debug or timing:
+                        print(f"[DEBUG] Timing: compare tables took {compare_ms}ms", file=sys.stderr)
             else:
-                for arg in tqdm(worker_args, desc="Processing tables", unit="table", file=progress_stream):
+                t_compare_start = time.monotonic()
+                for arg in tqdm(worker_args, desc="Processing tables", unit="table", file=progress_stream, disable=debug):
                     results.append(_process_table(arg))
+                compare_ms = int((time.monotonic() - t_compare_start) * 1000)
+                if debug or timing:
+                    print(f"[DEBUG] Timing: compare tables took {compare_ms}ms", file=sys.stderr)
 
             # Open output file or use stdout
             if output_to_stdout:
@@ -828,8 +870,16 @@ def generate_delta(old_file, new_file, delta_out=None):
                 f_out = open(output_file, 'w', encoding='utf-8')
 
             try:
-                f_out.write("-- Full Delta Update Script\n")
-                f_out.write("SET FOREIGN_KEY_CHECKS = 0;\n\n")
+                t_write_start = time.monotonic()
+                write_format_ms = 0
+                write_io_ms = 0
+
+                t_fmt = time.monotonic()
+                header = "-- Full Delta Update Script\nSET FOREIGN_KEY_CHECKS = 0;\n\n"
+                write_format_ms += int((time.monotonic() - t_fmt) * 1000)
+                t_io = time.monotonic()
+                f_out.write(header)
+                write_io_ms += int((time.monotonic() - t_io) * 1000)
 
                 insert_count = 0
                 update_count = 0
@@ -838,21 +888,44 @@ def generate_delta(old_file, new_file, delta_out=None):
                 # Write inserts/updates grouped by table (sorted for determinism)
                 for res in sorted(results, key=lambda r: r['table']):
                     if res['changes']:
-                        f_out.write(f"-- TABLE {res['table']}\n")
-                        f_out.write(res['changes'])
+                        t_fmt = time.monotonic()
+                        chunk = f"-- TABLE {res['table']}\n{res['changes']}"
+                        write_format_ms += int((time.monotonic() - t_fmt) * 1000)
+                        t_io = time.monotonic()
+                        f_out.write(chunk)
+                        write_io_ms += int((time.monotonic() - t_io) * 1000)
                     insert_count += res['insert_count']
                     update_count += res['update_count']
 
                 # Deletions
                 print("Step 4: Identifying Deletions...", file=sys.stderr)
-                f_out.write("-- DELETIONS\n")
+                t_fmt = time.monotonic()
+                del_header = "-- DELETIONS\n"
+                write_format_ms += int((time.monotonic() - t_fmt) * 1000)
+                t_io = time.monotonic()
+                f_out.write(del_header)
+                write_io_ms += int((time.monotonic() - t_io) * 1000)
+                t_delete_start = time.monotonic()
                 for res in sorted(results, key=lambda r: r['table']):
                     if res['deletions']:
-                        f_out.write(f"-- TABLE {res['table']}\n")
-                        f_out.write(res['deletions'])
+                        t_fmt = time.monotonic()
+                        dchunk = f"-- TABLE {res['table']}\n{res['deletions']}"
+                        write_format_ms += int((time.monotonic() - t_fmt) * 1000)
+                        t_io = time.monotonic()
+                        f_out.write(dchunk)
+                        write_io_ms += int((time.monotonic() - t_io) * 1000)
                     delete_count += res['delete_count']
+                delete_ms = int((time.monotonic() - t_delete_start) * 1000)
+                if debug or timing:
+                    print(f"[DEBUG] Timing: deletion pass took {delete_ms}ms", file=sys.stderr)
 
-                f_out.write("SET FOREIGN_KEY_CHECKS = 1;\n")
+                t_fmt = time.monotonic()
+                tail = "SET FOREIGN_KEY_CHECKS = 1;\n"
+                write_format_ms += int((time.monotonic() - t_fmt) * 1000)
+                t_io = time.monotonic()
+                f_out.write(tail)
+                write_io_ms += int((time.monotonic() - t_io) * 1000)
+                write_ms = int((time.monotonic() - t_write_start) * 1000)
             finally:
                 if not output_to_stdout:
                     f_out.close()
@@ -864,6 +937,55 @@ def generate_delta(old_file, new_file, delta_out=None):
     print("\n" + "="*60, file=sys.stderr)
     print("SUMMARY", file=sys.stderr)
     print("="*60, file=sys.stderr)
+
+    if debug or timing:
+        timings = []
+        for r in results:
+            t = r.get('timing', {})
+            timings.append({
+                'table': r.get('table'),
+                'total_ms': t.get('total_ms', 0),
+                'load_ms': t.get('load_ms', 0),
+                'compare_ms': t.get('compare_ms', 0),
+                'delete_ms': t.get('delete_ms', 0),
+            })
+        timings.sort(key=lambda t: t['total_ms'], reverse=True)
+        top = timings[:10]
+        if top:
+            print("[DEBUG] Timing: top 10 slowest tables (ms):", file=sys.stderr)
+            for t in top:
+                print(
+                    f"[DEBUG]   {t['table']} total={t['total_ms']} "
+                    f"load={t['load_ms']} compare={t['compare_ms']} delete={t['delete_ms']}",
+                    file=sys.stderr,
+                )
+
+    if timing_json:
+        table_entries = [
+            {
+                'table': r.get('table'),
+                'load_ms': r.get('timing', {}).get('load_ms', 0),
+                'compare_ms': r.get('timing', {}).get('compare_ms', 0),
+                'delete_ms': r.get('timing', {}).get('delete_ms', 0),
+                'total_ms': r.get('timing', {}).get('total_ms', 0),
+            }
+            for r in results
+        ]
+        table_entries.sort(key=lambda t: t['total_ms'], reverse=True)
+        report = {
+            'schema_ms': schema_ms,
+            'split_ms': split_ms,
+            'compare_ms': compare_ms,
+            'delete_ms': delete_ms,
+            'write_ms': write_ms,
+            'write_format_ms': write_format_ms,
+            'write_io_ms': write_io_ms,
+            'total_ms': schema_ms + split_ms + compare_ms + delete_ms + write_ms,
+            'wall_ms': int((time.monotonic() - wall_start) * 1000),
+            'tables': table_entries,
+        }
+        with open(timing_json, 'w', encoding='utf-8') as jf:
+            json.dump(report, jf, indent=2)
     print(f"Inserts:  {insert_count:,}", file=sys.stderr)
     print(f"Updates:  {update_count:,}", file=sys.stderr)
     print(f"Deletes: {delete_count:,}", file=sys.stderr)
@@ -871,18 +993,25 @@ def generate_delta(old_file, new_file, delta_out=None):
     print("="*60, file=sys.stderr)
 
 if __name__ == "__main__":
-    # Filter out any PyInstaller or system arguments that might interfere
-    # PyInstaller sometimes adds arguments, so we filter out anything starting with '-'
-    args = [arg for arg in sys.argv[1:] if not arg.startswith('-')]
-    
-    if len(args) < 2:
-        print("Usage: sqldumpdiff <old_dump.sql> <new_dump.sql> [output.sql]", file=sys.stderr)
-        print("       If output.sql is not provided, delta SQL is printed to stdout", file=sys.stderr)
+    parser = argparse.ArgumentParser(description="Compare SQL dumps and generate delta SQL.")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging and disable progress bars")
+    parser.add_argument("--timing", action="store_true", help="Emit timing diagnostics even without --debug")
+    parser.add_argument("old_dump", help="Old SQL dump file")
+    parser.add_argument("new_dump", help="New SQL dump file")
+    parser.add_argument("output", nargs="?", default=None, help="Output delta SQL (optional)")
+    parser.add_argument("--timing-json", dest="timing_json", default=None, help="Write timing report JSON to file")
+    if len(sys.argv) == 1:
+        parser.print_help()
         sys.exit(1)
-    elif len(args) == 2:
-        # No output file specified, print to stdout
-        generate_delta(args[0], args[1], None)
-    else:
-        # Output file specified
-        generate_delta(args[0], args[1], args[2])
-        print(f"\nDelta script written to: {args[2]}", file=sys.stderr)
+    args = parser.parse_args()
+
+    generate_delta(
+        args.old_dump,
+        args.new_dump,
+        args.output,
+        debug=args.debug,
+        timing=args.timing,
+        timing_json=args.timing_json,
+    )
+    if args.output:
+        print(f"\nDelta script written to: {args.output}", file=sys.stderr)
