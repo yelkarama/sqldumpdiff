@@ -13,13 +13,5 @@ pub struct InsertRow {
 }
 
 impl InsertRow {
-    // Convert to JSON string for JSONL storage.
-    pub fn to_json(&self) -> Result<String, serde_json::Error> {
-        serde_json::to_string(self)
-    }
-
-    // Parse from JSON string back into InsertRow.
-    pub fn from_json(line: &str) -> Result<InsertRow, serde_json::Error> {
-        serde_json::from_str(line)
-    }
+    // JSON helpers removed; binary row format is used for performance.
 }

@@ -10,7 +10,7 @@ use ahash::AHashSet;
 use blake3;
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, atomic::{AtomicU64, Ordering}};
 use std::time::Instant;
@@ -447,7 +447,7 @@ fn split_dump_by_table(
 ) -> Result<HashMap<String, String>, Box<dyn std::error::Error + Send + Sync>> {
     let insert_parser = InsertParser::new();
 
-    let mut writers: HashMap<String, BufWriter<File>> = HashMap::new();
+    let mut writers: HashMap<String, TableBinWriter> = HashMap::new();
     let mut table_paths: HashMap<String, String> = HashMap::new();
     let mut missing_tables: AHashSet<String> = AHashSet::new();
     let mut seen_tables: AHashSet<String> = AHashSet::new();
@@ -472,20 +472,42 @@ fn split_dump_by_table(
 
             let writer = writers.entry(resolved.clone()).or_insert_with(|| {
                 let name = sanitize_filename(&resolved);
-                let path = tmp_dir.join(format!("{}_{}.jsonl", label, name));
+                let path = tmp_dir.join(format!("{}_{}.bin", label, name));
                 let file = File::create(&path).expect("create temp jsonl");
                 table_paths.insert(resolved.clone(), path.to_string_lossy().to_string());
-                BufWriter::new(file)
+                let mut w = BufWriter::new(file);
+                // Write header once per table (columns are stable for the table).
+                if let Err(e) = write_table_header(&mut w, &row.columns) {
+                    logger::debug(&format!("splitDumpByTable: failed to write header: {}", e));
+                }
+                TableBinWriter {
+                    columns: row.columns.clone(),
+                    writer: w,
+                }
             });
 
-            if let Ok(json) = row.to_json() {
-                let _ = writeln!(writer, "{}", json);
+            // Ensure columns are consistent; skip inconsistent rows to avoid corruption.
+            if row.columns.len() != writer.columns.len() {
+                logger::debug(&format!(
+                    "splitDumpByTable: skip row for {} (column count mismatch {} != {})",
+                    resolved,
+                    row.columns.len(),
+                    writer.columns.len()
+                ));
+                return;
+            }
+            let mut values = Vec::with_capacity(writer.columns.len());
+            for col in &writer.columns {
+                values.push(row.data.get(col).cloned().unwrap_or_default());
+            }
+            if let Err(e) = write_row_values(&mut writer.writer, &values) {
+                logger::debug(&format!("splitDumpByTable: failed to write row: {}", e));
             }
         },
     )?;
 
     for (_, mut w) in writers {
-        let _ = w.flush();
+        let _ = w.writer.flush();
     }
 
     if !missing_tables.is_empty() {
@@ -587,9 +609,13 @@ fn compare_table_sqlite(
         delete_ms: 0,
     };
 
+    let mut columns: Vec<String> = Vec::new();
+
     if !old_path.is_empty() {
         let load_start = Instant::now();
-        load_table_jsonl(&mut conn, old_path, pk_cols, tunables.batch_size)?;
+        let (cols, mut reader) = open_table_bin(old_path)?;
+        columns = cols.clone();
+        load_table_bin(&mut conn, &mut reader, &columns, pk_cols, tunables.batch_size)?;
         timing.load_ms = load_start.elapsed().as_millis();
         if timing_enabled || logger::is_debug() {
             logger::debug(&format!(
@@ -602,9 +628,24 @@ fn compare_table_sqlite(
 
     let mut seen: AHashSet<String> = AHashSet::new();
 
+    if columns.is_empty() && !new_path.is_empty() {
+        // Old file missing: pull columns from new file header.
+        let (cols, _reader) = open_table_bin(new_path)?;
+        columns = cols;
+    }
+
     if !new_path.is_empty() {
         let compare_start = Instant::now();
-        compare_new_rows(&conn, new_path, pk_cols, &mut result, &mut seen)?;
+        let (_cols, mut reader) = open_table_bin(new_path)?;
+        compare_new_rows(
+            &conn,
+            table,
+            &mut reader,
+            &columns,
+            pk_cols,
+            &mut result,
+            &mut seen,
+        )?;
         timing.compare_ms = compare_start.elapsed().as_millis();
         if timing_enabled || logger::is_debug() {
             logger::debug(&format!(
@@ -616,7 +657,7 @@ fn compare_table_sqlite(
     }
 
     let delete_start = Instant::now();
-    emit_deletions(&conn, pk_cols, &mut result, &seen)?;
+    emit_deletions(&conn, table, &columns, pk_cols, &mut result, &seen)?;
     timing.delete_ms = delete_start.elapsed().as_millis();
     if timing_enabled || logger::is_debug() {
         logger::debug(&format!(
@@ -634,44 +675,33 @@ fn compare_table_sqlite(
     Ok((result, timing))
 }
 
-// Load old rows into SQLite.
-fn load_table_jsonl(
+// Load old rows into SQLite from the binary table file.
+fn load_table_bin(
     conn: &mut Connection,
-    path: &str,
+    reader: &mut BufReader<File>,
+    columns: &[String],
     pk_cols: &[String],
     batch_size: usize,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let file = File::open(path)?;
-    let mut reader = BufReader::new(file);
-
     let mut tx = conn.transaction()?;
     let mut stmt = tx.prepare_cached(
-        "INSERT OR REPLACE INTO rows(pk_hash, row_hash, row_json) VALUES(?1, ?2, ?3)",
+        "INSERT OR REPLACE INTO rows(pk_hash, row_hash, row_blob) VALUES(?1, ?2, ?3)",
     )?;
 
     let mut batch = 0usize;
-    let mut line = String::new();
-
-    loop {
-        line.clear();
-        let read = reader.read_line(&mut line)?;
-        if read == 0 {
-            break;
-        }
-        if line.trim().is_empty() {
-            continue;
-        }
-        let row = InsertRow::from_json(&line)?;
+    while let Some(values) = read_row_values(reader)? {
+        let row = build_row_from_values("", columns, &values);
         let pk = hash_pk(&row, pk_cols);
         let rh = row_hash(&row);
-        stmt.execute(params![pk, rh, line])?;
+        let blob = encode_row_values(&values);
+        stmt.execute(params![pk, rh, blob])?;
         batch += 1;
         if batch >= batch_size {
             drop(stmt);
             tx.commit()?;
             tx = conn.transaction()?;
             stmt = tx.prepare_cached(
-                "INSERT OR REPLACE INTO rows(pk_hash, row_hash, row_json) VALUES(?1, ?2, ?3)",
+                "INSERT OR REPLACE INTO rows(pk_hash, row_hash, row_blob) VALUES(?1, ?2, ?3)",
             )?;
             batch = 0;
         }
@@ -685,39 +715,30 @@ fn load_table_jsonl(
 // Compare new rows to old rows stored in SQLite.
 fn compare_new_rows(
     conn: &Connection,
-    new_path: &str,
+    table: &str,
+    reader: &mut BufReader<File>,
+    columns: &[String],
     pk_cols: &[String],
     result: &mut ComparisonResult,
     seen: &mut AHashSet<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let file = File::open(new_path)?;
-    let mut reader = BufReader::new(file);
+    let mut stmt = conn.prepare("SELECT row_hash, row_blob FROM rows WHERE pk_hash = ?1")?;
 
-    let mut stmt = conn.prepare("SELECT row_hash, row_json FROM rows WHERE pk_hash = ?1")?;
-
-    let mut line = String::new();
-    loop {
-        line.clear();
-        let read = reader.read_line(&mut line)?;
-        if read == 0 {
-            break;
-        }
-        if line.trim().is_empty() {
-            continue;
-        }
-        let new_row = InsertRow::from_json(&line)?;
+    while let Some(values) = read_row_values(reader)? {
+        let new_row = build_row_from_values(table, columns, &values);
         let pk = hash_pk(&new_row, pk_cols);
         let new_hash = row_hash(&new_row);
 
         let mut rows = stmt.query(params![pk.clone()])?;
         if let Some(row) = rows.next()? {
             let old_hash: Vec<u8> = row.get(0)?;
-            let old_row_str: String = row.get(1)?;
+            let old_blob: Vec<u8> = row.get(1)?;
             seen.insert(pk.clone());
             if old_hash == new_hash {
                 continue;
             }
-            let old_row = InsertRow::from_json(&old_row_str)?;
+            let old_values = decode_row_values(&old_blob)?;
+            let old_row = build_row_from_values(table, columns, &old_values);
             let updates = find_updates(&old_row, &new_row);
             if !updates.is_empty() {
                 result.changes.push_str(&format!("-- TABLE {}\n", new_row.table));
@@ -750,19 +771,22 @@ fn compare_new_rows(
 // Emit deletions for rows not seen in new file.
 fn emit_deletions(
     conn: &Connection,
+    table: &str,
+    columns: &[String],
     pk_cols: &[String],
     result: &mut ComparisonResult,
     seen: &AHashSet<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut stmt = conn.prepare("SELECT pk_hash, row_json FROM rows")?;
+    let mut stmt = conn.prepare("SELECT pk_hash, row_blob FROM rows")?;
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
         let pk_hash: String = row.get(0)?;
-        let row_str: String = row.get(1)?;
+        let row_blob: Vec<u8> = row.get(1)?;
         if seen.contains(&pk_hash) {
             continue;
         }
-        let old_row = InsertRow::from_json(&row_str)?;
+        let values = decode_row_values(&row_blob)?;
+        let old_row = build_row_from_values(table, columns, &values);
         result
             .deletions
             .push_str(&format!("-- DELETED FROM {}: {}\n", old_row.table, pk_hash));
@@ -804,7 +828,7 @@ fn setup_sqlite_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Erro
         "CREATE TABLE IF NOT EXISTS rows (\
             pk_hash TEXT PRIMARY KEY,\
             row_hash BLOB NOT NULL,\
-            row_json TEXT NOT NULL\
+            row_blob BLOB NOT NULL\
         );",
         [],
     )?;
@@ -839,6 +863,147 @@ fn hash_pk(row: &InsertRow, pk_cols: &[String]) -> String {
         hasher.update(norm.as_bytes());
     }
     hex::encode(hasher.finalize().as_bytes())
+}
+
+// Binary table file writer (header + rows).
+struct TableBinWriter {
+    columns: Vec<String>,
+    writer: BufWriter<File>,
+}
+
+// Write a binary table header: magic, version, column list.
+fn write_table_header(w: &mut BufWriter<File>, columns: &[String]) -> std::io::Result<()> {
+    w.write_all(b"SQDR")?;
+    write_u32(w, 1)?;
+    write_u32(w, columns.len() as u32)?;
+    for col in columns {
+        write_bytes(w, col.as_bytes())?;
+    }
+    Ok(())
+}
+
+// Read header and return columns + reader.
+fn open_table_bin(path: &str) -> std::io::Result<(Vec<String>, BufReader<File>)> {
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let mut magic = [0u8; 4];
+    reader.read_exact(&mut magic)?;
+    if &magic != b"SQDR" {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid table file magic",
+        ));
+    }
+    let version = read_u32_required(&mut reader)?;
+    if version != 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "unsupported table file version",
+        ));
+    }
+    let col_count = read_u32_required(&mut reader)? as usize;
+    let mut columns = Vec::with_capacity(col_count);
+    for _ in 0..col_count {
+        let bytes = read_bytes(&mut reader)?;
+        columns.push(String::from_utf8(bytes).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid utf-8 column")
+        })?);
+    }
+    Ok((columns, reader))
+}
+
+// Write a row as: num_vals + (len + bytes) per value.
+fn write_row_values(w: &mut BufWriter<File>, values: &[String]) -> std::io::Result<()> {
+    write_u32(w, values.len() as u32)?;
+    for v in values {
+        write_bytes(w, v.as_bytes())?;
+    }
+    Ok(())
+}
+
+// Encode values into a single blob for SQLite storage.
+fn encode_row_values(values: &[String]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(values.len() * 8);
+    let _ = write_u32(&mut buf, values.len() as u32);
+    for v in values {
+        let _ = write_bytes(&mut buf, v.as_bytes());
+    }
+    buf
+}
+
+// Decode values from a blob stored in SQLite.
+fn decode_row_values(blob: &[u8]) -> std::io::Result<Vec<String>> {
+    let mut reader = std::io::Cursor::new(blob);
+    let count = read_u32_required(&mut reader)? as usize;
+    let mut values = Vec::with_capacity(count);
+    for _ in 0..count {
+        let bytes = read_bytes(&mut reader)?;
+        values.push(String::from_utf8(bytes).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid utf-8 value")
+        })?);
+    }
+    Ok(values)
+}
+
+// Read a row; returns None on EOF.
+fn read_row_values(reader: &mut BufReader<File>) -> std::io::Result<Option<Vec<String>>> {
+    let count = match read_u32(reader)? {
+        Some(v) => v as usize,
+        None => return Ok(None),
+    };
+    let mut values = Vec::with_capacity(count);
+    for _ in 0..count {
+        let bytes = read_bytes(reader)?;
+        values.push(String::from_utf8(bytes).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid utf-8 value")
+        })?);
+    }
+    Ok(Some(values))
+}
+
+fn write_u32<W: Write>(w: &mut W, v: u32) -> std::io::Result<()> {
+    w.write_all(&v.to_le_bytes())
+}
+
+fn read_u32<R: Read>(r: &mut R) -> std::io::Result<Option<u32>> {
+    let mut buf = [0u8; 4];
+    match r.read_exact(&mut buf) {
+        Ok(()) => Ok(Some(u32::from_le_bytes(buf))),
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+fn read_u32_required<R: Read>(r: &mut R) -> std::io::Result<u32> {
+    let mut buf = [0u8; 4];
+    r.read_exact(&mut buf)?;
+    Ok(u32::from_le_bytes(buf))
+}
+
+fn write_bytes<W: Write>(w: &mut W, bytes: &[u8]) -> std::io::Result<()> {
+    write_u32(w, bytes.len() as u32)?;
+    w.write_all(bytes)
+}
+
+fn read_bytes<R: Read>(r: &mut R) -> std::io::Result<Vec<u8>> {
+    let len = read_u32_required(r)? as usize;
+    let mut buf = vec![0u8; len];
+    r.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
+// Build InsertRow from values and columns without reparsing SQL.
+fn build_row_from_values(table: &str, columns: &[String], values: &[String]) -> InsertRow {
+    let mut data = HashMap::with_capacity(columns.len());
+    for (i, col) in columns.iter().enumerate() {
+        let val = values.get(i).cloned().unwrap_or_default();
+        data.insert(col.clone(), val);
+    }
+    InsertRow {
+        table: table.to_string(),
+        columns: columns.to_vec(),
+        data,
+    }
 }
 
 // Case-insensitive value lookup from row data.
