@@ -5,7 +5,7 @@ use crate::logger;
 use crate::parser::insert::InsertParser;
 use crate::parser::InsertRow;
 use rayon::prelude::*;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use ahash::AHashSet;
 use blake3;
 use std::collections::HashMap;
@@ -637,12 +637,15 @@ fn compare_table_sqlite(
     if !new_path.is_empty() {
         let compare_start = Instant::now();
         let (_cols, mut reader) = open_table_bin(new_path)?;
+        let file_size = std::fs::metadata(new_path).map(|m| m.len()).unwrap_or(0);
+        let batch_hint = adjust_batch_by_file_size(tunables.batch_size, file_size);
         compare_new_rows(
             &conn,
             table,
             &mut reader,
             &columns,
             pk_cols,
+            batch_hint,
             &mut result,
             &mut seen,
         )?;
@@ -719,25 +722,90 @@ fn compare_new_rows(
     reader: &mut BufReader<File>,
     columns: &[String],
     pk_cols: &[String],
+    batch_hint: usize,
     result: &mut ComparisonResult,
     seen: &mut AHashSet<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut stmt = conn.prepare("SELECT row_hash, row_blob FROM rows WHERE pk_hash = ?1")?;
+    let batch = compute_compare_batch_size(conn, batch_hint)?;
+    // Prepare a statement for full batches to avoid re-preparing each time.
+    let full_sql = build_in_query(batch);
+    let mut full_stmt = conn.prepare(&full_sql)?;
+    let mut pending: Vec<(String, Vec<String>)> = Vec::with_capacity(batch);
+    let mut pending_keys: Vec<String> = Vec::with_capacity(batch);
 
     while let Some(values) = read_row_values(reader)? {
         let new_row = build_row_from_values(table, columns, &values);
         let pk = hash_pk(&new_row, pk_cols);
-        let new_hash = row_hash(&new_row);
 
-        let mut rows = stmt.query(params![pk.clone()])?;
-        if let Some(row) = rows.next()? {
-            let old_hash: Vec<u8> = row.get(0)?;
-            let old_blob: Vec<u8> = row.get(1)?;
+        pending_keys.push(pk);
+        pending.push((new_row.table.clone(), values));
+
+        if pending.len() >= batch {
+            compare_batch_prepared(
+                &mut full_stmt,
+                table,
+                columns,
+                pk_cols,
+                &pending,
+                &pending_keys,
+                result,
+                seen,
+            )?;
+            pending.clear();
+            pending_keys.clear();
+        }
+    }
+
+    if !pending.is_empty() {
+        compare_batch_once(
+            conn,
+            table,
+            columns,
+            pk_cols,
+            &pending,
+            &pending_keys,
+            result,
+            seen,
+        )?;
+    }
+
+    Ok(())
+}
+
+fn compare_batch_prepared(
+    stmt: &mut rusqlite::Statement<'_>,
+    table: &str,
+    columns: &[String],
+    pk_cols: &[String],
+    pending: &[(String, Vec<String>)],
+    pending_keys: &[String],
+    result: &mut ComparisonResult,
+    seen: &mut AHashSet<String>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let params = rusqlite::params_from_iter(pending_keys.iter());
+    let mut rows = stmt.query(params)?;
+
+    let mut old_map: HashMap<String, (Vec<u8>, Vec<u8>)> = HashMap::new();
+    while let Some(row) = rows.next()? {
+        let pk: String = row.get(0)?;
+        let h: Vec<u8> = row.get(1)?;
+        let blob: Vec<u8> = row.get(2)?;
+        old_map.insert(pk, (h, blob));
+    }
+
+    for (idx, (_tbl, values)) in pending.iter().enumerate() {
+        let pk = &pending_keys[idx];
+        if let Some((old_hash, old_blob)) = old_map.get(pk) {
             seen.insert(pk.clone());
-            if old_hash == new_hash {
+            let new_hash = row_hash_values(values, columns);
+            if old_hash == &new_hash {
                 continue;
             }
-            let old_values = decode_row_values(&old_blob)?;
+            let new_row = build_row_from_values(table, columns, values);
+            let old_values = decode_row_values(old_blob)?;
             let old_row = build_row_from_values(table, columns, &old_values);
             let updates = find_updates(&old_row, &new_row);
             if !updates.is_empty() {
@@ -754,6 +822,7 @@ fn compare_new_rows(
                 result.update_count += 1;
             }
         } else {
+            let new_row = build_row_from_values(table, columns, values);
             result
                 .changes
                 .push_str(&format!("-- NEW RECORD IN {}\n", new_row.table));
@@ -766,6 +835,123 @@ fn compare_new_rows(
     }
 
     Ok(())
+}
+
+fn compare_batch_once(
+    conn: &Connection,
+    table: &str,
+    columns: &[String],
+    pk_cols: &[String],
+    pending: &[(String, Vec<String>)],
+    pending_keys: &[String],
+    result: &mut ComparisonResult,
+    seen: &mut AHashSet<String>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let sql = build_in_query(pending_keys.len());
+    let mut stmt = conn.prepare(&sql)?;
+    let params = rusqlite::params_from_iter(pending_keys.iter());
+    let mut rows = stmt.query(params)?;
+
+    let mut old_map: HashMap<String, (Vec<u8>, Vec<u8>)> = HashMap::new();
+    while let Some(row) = rows.next()? {
+        let pk: String = row.get(0)?;
+        let h: Vec<u8> = row.get(1)?;
+        let blob: Vec<u8> = row.get(2)?;
+        old_map.insert(pk, (h, blob));
+    }
+
+    for (idx, (_tbl, values)) in pending.iter().enumerate() {
+        let pk = &pending_keys[idx];
+        if let Some((old_hash, old_blob)) = old_map.get(pk) {
+            seen.insert(pk.clone());
+            let new_hash = row_hash_values(values, columns);
+            if old_hash == &new_hash {
+                continue;
+            }
+            let new_row = build_row_from_values(table, columns, values);
+            let old_values = decode_row_values(old_blob)?;
+            let old_row = build_row_from_values(table, columns, &old_values);
+            let updates = find_updates(&old_row, &new_row);
+            if !updates.is_empty() {
+                result.changes.push_str(&format!("-- TABLE {}\n", new_row.table));
+                for (col, old_val) in &updates {
+                    result
+                        .changes
+                        .push_str(&format!("-- {} old value: {}\n", col, old_val));
+                }
+                result
+                    .changes
+                    .push_str(&build_update_statement(&new_row, pk_cols, &updates));
+                result.changes.push_str("\n\n");
+                result.update_count += 1;
+            }
+        } else {
+            let new_row = build_row_from_values(table, columns, values);
+            result
+                .changes
+                .push_str(&format!("-- NEW RECORD IN {}\n", new_row.table));
+            result
+                .changes
+                .push_str(&build_insert_statement(&new_row));
+            result.changes.push_str("\n\n");
+            result.insert_count += 1;
+        }
+    }
+
+    Ok(())
+}
+
+fn build_in_query(count: usize) -> String {
+    let mut placeholders = String::new();
+    for i in 0..count {
+        if i > 0 {
+            placeholders.push(',');
+        }
+        placeholders.push('?');
+    }
+    format!(
+        "SELECT pk_hash, row_hash, row_blob FROM rows WHERE pk_hash IN ({})",
+        placeholders
+    )
+}
+
+fn compute_compare_batch_size(
+    conn: &Connection,
+    batch_hint: usize,
+) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+    let max_vars: Option<i64> = conn
+        .query_row("PRAGMA max_variable_number;", [], |row| row.get(0))
+        .optional()?;
+    // For "IN (?)" we need one variable per PK. Fallback if PRAGMA unsupported.
+    let mut cap = match max_vars {
+        Some(v) if v > 0 => v as usize,
+        _ => 512,
+    };
+    if cap > 1 {
+        cap -= 1;
+    }
+    let hint = if batch_hint > 0 { batch_hint } else { 512 };
+    Ok(std::cmp::max(1, std::cmp::min(hint, cap)))
+}
+
+fn adjust_batch_by_file_size(base: usize, file_size_bytes: u64) -> usize {
+    // Scale batch down for large tables to limit memory spikes.
+    let mb = file_size_bytes as f64 / (1024.0 * 1024.0);
+    let scaled = if mb < 64.0 {
+        base
+    } else if mb < 256.0 {
+        base.saturating_mul(1) / 2
+    } else if mb < 1024.0 {
+        base.saturating_mul(1) / 4
+    } else if mb < 4096.0 {
+        base.saturating_mul(1) / 8
+    } else {
+        base.saturating_mul(1) / 16
+    };
+    std::cmp::max(64, scaled)
 }
 
 // Emit deletions for rows not seen in new file.
@@ -844,6 +1030,21 @@ fn row_hash(row: &InsertRow) -> Vec<u8> {
         hasher.update(lower.as_bytes());
         hasher.update(b"=");
         let val = get_column_value_ci(row, col);
+        let norm = normalize_null(&val);
+        hasher.update(norm.as_bytes());
+        hasher.update(b";");
+    }
+    hasher.finalize().as_bytes().to_vec()
+}
+
+// Compute row hash directly from values + columns.
+fn row_hash_values(values: &[String], columns: &[String]) -> Vec<u8> {
+    let mut hasher = blake3::Hasher::new();
+    for (i, col) in columns.iter().enumerate() {
+        let lower = col.to_lowercase();
+        hasher.update(lower.as_bytes());
+        hasher.update(b"=");
+        let val = values.get(i).cloned().unwrap_or_default();
         let norm = normalize_null(&val);
         hasher.update(norm.as_bytes());
         hasher.update(b";");
