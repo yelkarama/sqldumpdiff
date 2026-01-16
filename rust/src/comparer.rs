@@ -11,13 +11,13 @@ use memmap2::Mmap;
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Write};
+#[cfg(not(unix))]
+use std::io::{Seek, SeekFrom};
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, atomic::{AtomicU64, Ordering}};
 use std::time::Instant;
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
-#[cfg(windows)]
-use std::os::windows::fs::FileExt;
 
 pub struct ComparisonResult {
     pub changes: String,
@@ -626,13 +626,13 @@ impl TableStore {
             return Ok(Some((row_hash, blob)));
         }
         let mut header = [0u8; 36];
-        self.file.read_at(&mut header, offset as u64)?;
+        read_at(&self.file, offset as u64, &mut header)?;
         let mut row_hash = [0u8; 32];
         row_hash.copy_from_slice(&header[..32]);
         let len = u32::from_le_bytes(header[32..36].try_into()?);
         let mut blob = vec![0u8; len as usize];
         if len > 0 {
-            self.file.read_at(&mut blob, offset as u64 + 36)?;
+            read_at(&self.file, offset as u64 + 36, &mut blob)?;
         }
         Ok(Some((row_hash, blob)))
     }
@@ -643,6 +643,20 @@ impl TableStore {
         }
         let _ = fs::remove_file(&self.path);
     }
+}
+
+#[cfg(unix)]
+fn read_at(file: &File, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+    file.read_at(buf, offset)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn read_at(file: &File, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+    let mut f = file;
+    f.seek(SeekFrom::Start(offset))?;
+    f.read_exact(buf)?;
+    Ok(())
 }
 
 fn build_pk_index(columns: &[String], pk_cols: &[String]) -> Result<Vec<usize>, Box<dyn std::error::Error + Send + Sync>> {
