@@ -17,30 +17,30 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// sqliteProfilesFile is the on-disk YAML shape for performance presets.
+// storeProfilesFile is the on-disk YAML shape for performance presets.
 // It keeps the CLI defaults out of code so we can tweak them without recompiling.
-type sqliteProfilesFile struct {
-	Profiles map[string]sqliteProfile `yaml:"profiles"`
+type storeProfilesFile struct {
+	Profiles map[string]storeProfile `yaml:"profiles"`
 }
 
-// sqliteProfile represents one preset for SQLite tuning.
+// storeProfile represents one preset for on-disk store tuning.
 // These map directly onto the runtime knobs used by the comparer package.
-type sqliteProfile struct {
-	CacheKB int `yaml:"cache_kb"`
-	MmapMB  int `yaml:"mmap_mb"`
-	Batch   int `yaml:"batch"`
-	Workers int `yaml:"workers"`
+type storeProfile struct {
+	ReaderKB int `yaml:"reader_kb"`
+	WriterKB int `yaml:"writer_kb"`
+	Workers  int `yaml:"workers"`
+	Mmap     bool `yaml:"mmap"`
 }
 
-// loadSQLiteProfiles reads the YAML file and returns the profile map.
+// loadStoreProfiles reads the YAML file and returns the profile map.
 // We keep YAML parsing here (CLI layer) instead of in comparer to keep that
 // package focused on diff logic.
-func loadSQLiteProfiles(path string) (map[string]sqliteProfile, error) {
+func loadStoreProfiles(path string) (map[string]storeProfile, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	var cfg sqliteProfilesFile
+	var cfg storeProfilesFile
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, err
 	}
@@ -51,7 +51,7 @@ func loadSQLiteProfiles(path string) (map[string]sqliteProfile, error) {
 }
 
 // profileKeys returns a stable list of profile names for error messages.
-func profileKeys(m map[string]sqliteProfile) []string {
+func profileKeys(m map[string]storeProfile) []string {
 	keys := make([]string, 0, len(m))
 	for k := range m {
 		keys = append(keys, k)
@@ -67,8 +67,11 @@ func main() {
 	debug := flag.Bool("debug", false, "Enable debug logging")
 	timing := flag.Bool("timing", false, "Emit timing diagnostics even without --debug")
 	timingJSON := flag.String("timing-json", "", "Write timing report JSON to file")
-	sqliteProfile := flag.String("sqlite-profile", "fast", "SQLite tuning profile: low-mem, balanced, fast")
-	sqliteProfileFile := flag.String("sqlite-profile-file", "sqlite_profiles.yaml", "SQLite profiles YAML file")
+	storeProfile := flag.String("store-profile", "fast", "Store tuning profile: low-mem, balanced, fast")
+	storeProfileFile := flag.String("store-profile-file", "store_profiles.yaml", "Store profiles YAML file")
+	// Backward-compatible flag names (deprecated).
+	sqliteProfile := flag.String("sqlite-profile", "", "Deprecated: use --store-profile")
+	sqliteProfileFile := flag.String("sqlite-profile-file", "", "Deprecated: use --store-profile-file")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [--debug] [--timing] [--timing-json <file>] old_dump.sql new_dump.sql [delta.sql]\n", os.Args[0])
 		flag.PrintDefaults()
@@ -83,15 +86,30 @@ func main() {
 	}
 
 	// Load and apply the named profile from YAML.
-	profiles, err := loadSQLiteProfiles(*sqliteProfileFile)
+	profileName := *storeProfile
+	profilePath := *storeProfileFile
+	if *sqliteProfile != "" {
+		profileName = *sqliteProfile
+	}
+	if *sqliteProfileFile != "" {
+		profilePath = *sqliteProfileFile
+	}
+
+	profiles, err := loadStoreProfiles(profilePath)
 	if err != nil {
-		log.Fatalf("Failed to load SQLite profiles: %v", err)
+		// Backwards-compat: if the old default name is used and missing, try the new name.
+		if os.IsNotExist(err) && profilePath == "sqlite_profiles.yaml" {
+			profiles, err = loadStoreProfiles("store_profiles.yaml")
+		}
 	}
-	profile, ok := profiles[*sqliteProfile]
+	if err != nil {
+		log.Fatalf("Failed to load store profiles: %v", err)
+	}
+	profile, ok := profiles[profileName]
 	if !ok {
-		log.Fatalf("Invalid --sqlite-profile value: %s (available: %v)", *sqliteProfile, profileKeys(profiles))
+		log.Fatalf("Invalid profile value: %s (available: %v)", profileName, profileKeys(profiles))
 	}
-	comparer.ConfigureSQLiteTunables(profile.CacheKB, profile.MmapMB, profile.Batch, profile.Workers)
+	comparer.ConfigureStoreTunables(profile.ReaderKB, profile.WriterKB, profile.Workers, profile.Mmap)
 	comparer.ConfigureTiming(*timing)
 
 	// Remaining arguments are positional: old file, new file, and optional output path.

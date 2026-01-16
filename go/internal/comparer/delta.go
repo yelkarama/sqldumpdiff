@@ -3,7 +3,6 @@ package comparer
 import (
 	"bufio"
 	"bytes"
-	"database/sql"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
@@ -11,13 +10,13 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"syscall"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
 	"github.com/zeebo/blake3"
 
 	"github.com/vbauerster/mpb/v8"
@@ -66,12 +65,12 @@ type TimingMeta struct {
 	Tables    []*TableTiming
 }
 
-// SQLite tuning knobs (defaults are overridden by CLI profiles/flags).
+// Store tuning knobs (defaults are overridden by CLI profiles/flags).
 // These are package-level so the CLI can update them once at startup.
-var sqliteBatchSize = 20000
-var sqliteCacheKB = 800000
-var sqliteMmapMB = 128
-var sqliteWorkers = 0
+var storeReaderKB = 1024
+var storeWriterKB = 1024
+var storeWorkers = 0
+var storeMmap = false
 var timingEnabled = false
 
 // rowHash computes a deterministic hash of a row using column order.
@@ -106,6 +105,13 @@ func splitDumpByTable(dumpFile string, columnsMap map[string][]string, pkMap map
 			missingTables[row.Table] = true
 			return
 		}
+		pkCols, hasPK := pkMap[resolved]
+		if !hasPK {
+			return
+		}
+		if !rowHasPK(row, pkCols) {
+			return
+		}
 		bw, ok := writers[resolved]
 		if !ok {
 			name := sanitizeFilename(resolved)
@@ -115,7 +121,11 @@ func splitDumpByTable(dumpFile string, columnsMap map[string][]string, pkMap map
 				return
 			}
 			files[resolved] = f
-			writer := bufio.NewWriter(f)
+			writerSize := storeWriterKB * 1024
+			if writerSize <= 0 {
+				writerSize = 1024 * 1024
+			}
+			writer := bufio.NewWriterSize(f, writerSize)
 			if err := writeTableHeader(writer, row.Columns); err != nil {
 				return
 			}
@@ -155,6 +165,26 @@ func splitDumpByTable(dumpFile string, columnsMap map[string][]string, pkMap map
 	}
 	logger.Debug("splitDumpByTable: %s saw %d tables in INSERTs, wrote %d table files", label, len(seenTables), len(tablePaths))
 	return tablePaths, nil
+}
+
+func rowHasPK(row *parser.InsertRow, pkCols []string) bool {
+	for _, col := range pkCols {
+		if _, ok := row.Data[col]; ok {
+			continue
+		}
+		found := false
+		colLower := strings.ToLower(col)
+		for key := range row.Data {
+			if strings.ToLower(key) == colLower {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
 }
 
 // sanitizeFilename converts a table name into a safe filename and adds
@@ -218,7 +248,11 @@ func openTableBin(path string) ([]string, *os.File, *bufio.Reader, error) {
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	r := bufio.NewReader(f)
+	readerSize := storeReaderKB * 1024
+	if readerSize <= 0 {
+		readerSize = 1024 * 1024
+	}
+	r := bufio.NewReaderSize(f, readerSize)
 	magic := make([]byte, 4)
 	if _, err := io.ReadFull(r, magic); err != nil {
 		f.Close()
@@ -389,29 +423,22 @@ func buildInsertFromValues(table string, columns []string, values []string) stri
 }
 
 func rowHashValues(values []string, columns []string) []byte {
-	var b strings.Builder
-	for i, col := range columns {
-		b.WriteString(strings.ToLower(col))
-		b.WriteString("=")
-		val := ""
-		if i < len(values) {
-			val = values[i]
-		}
-		b.WriteString(normalizeNull(val))
-		b.WriteString(";")
-	}
-	sum := blake3.Sum256([]byte(b.String()))
+	sum := rowHashValuesBytes(values, columns)
 	return sum[:]
 }
 
 func buildPKIndex(columns []string, pkCols []string) []int {
 	idx := make([]int, 0, len(pkCols))
 	for _, pk := range pkCols {
+		found := -1
 		for i, col := range columns {
-			if col == pk {
-				idx = append(idx, i)
+			if strings.EqualFold(col, pk) {
+				found = i
 				break
 			}
+		}
+		if found >= 0 {
+			idx = append(idx, found)
 		}
 	}
 	return idx
@@ -431,79 +458,176 @@ func hashPKValues(values []string, pkIndex []int) string {
 	return hex.EncodeToString(hash[:])
 }
 
-// loadTableBin reads a binary table file and stores it in SQLite.
-func loadTableBin(db *sql.DB, r *bufio.Reader, columns []string, pkCols []string) error {
-	pkIndex := buildPKIndex(columns, pkCols)
-	tx, stmt, err := beginSQLiteInsert(db)
-	if err != nil {
-		return fmt.Errorf("begin insert: %w", err)
+func rowHashValuesBytes(values []string, columns []string) [32]byte {
+	valueMap := make(map[string]string, len(columns))
+	for i, col := range columns {
+		key := strings.ToLower(col)
+		val := ""
+		if i < len(values) {
+			val = values[i]
+		}
+		valueMap[key] = normalizeNull(val)
 	}
-	defer stmt.Close()
+	keys := make([]string, 0, len(valueMap))
+	for k := range valueMap {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	for _, key := range keys {
+		b.WriteString(key)
+		b.WriteString("=")
+		b.WriteString(valueMap[key])
+		b.WriteString(";")
+	}
+	return blake3.Sum256([]byte(b.String()))
+}
 
-	batchCount := 0
+func hashPKValuesBytes(values []string, pkIndex []int) [32]byte {
+	parts := make([]string, 0, len(pkIndex))
+	for _, idx := range pkIndex {
+		val := ""
+		if idx >= 0 && idx < len(values) {
+			val = values[idx]
+		}
+		parts = append(parts, normalizeNull(val))
+	}
+	data := strings.Join(parts, "|")
+	return blake3.Sum256([]byte(data))
+}
+
+type tableStore struct {
+	file  *os.File
+	path  string
+	index map[[32]byte]int64
+	mmap  []byte
+}
+
+func buildTableStoreFromReader(r *bufio.Reader, columns []string, pkCols []string) (*tableStore, error) {
+	storeFile, err := os.CreateTemp("", "sqldumpdiff_store_*.bin")
+	if err != nil {
+		return nil, fmt.Errorf("create store: %w", err)
+	}
+	writerSize := storeWriterKB * 1024
+	if writerSize <= 0 {
+		writerSize = 1024 * 1024
+	}
+	writer := bufio.NewWriterSize(storeFile, writerSize)
+	pkIndex := buildPKIndex(columns, pkCols)
+	if len(pkIndex) != len(pkCols) {
+		storeFile.Close()
+		_ = os.Remove(storeFile.Name())
+		return nil, fmt.Errorf("missing PK columns for %s (have %d, need %d)", columns, len(pkIndex), len(pkCols))
+	}
+	index := make(map[[32]byte]int64)
+	var offset int64
+
 	for {
 		values, err := readRowValues(r)
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			_ = tx.Rollback()
-			return fmt.Errorf("read row: %w", err)
+			storeFile.Close()
+			_ = os.Remove(storeFile.Name())
+			return nil, fmt.Errorf("read row: %w", err)
 		}
-		hash := hashPKValues(values, pkIndex)
-		rh := rowHashValues(values, columns)
+		pkHash := hashPKValuesBytes(values, pkIndex)
+		rowHash := rowHashValuesBytes(values, columns)
 		blob := encodeRowValues(values)
-		if _, e := stmt.Exec(hash, rh, blob); e != nil {
-			_ = tx.Rollback()
-			return fmt.Errorf("insert row: %w", e)
+		index[pkHash] = offset
+		if _, err := writer.Write(rowHash[:]); err != nil {
+			storeFile.Close()
+			_ = os.Remove(storeFile.Name())
+			return nil, fmt.Errorf("write row hash: %w", err)
 		}
-		batchCount++
-		if batchCount >= sqliteBatchSize {
-			if err := stmt.Close(); err != nil {
-				_ = tx.Rollback()
-				return fmt.Errorf("close stmt: %w", err)
+		if err := writeU32(writer, uint32(len(blob))); err != nil {
+			storeFile.Close()
+			_ = os.Remove(storeFile.Name())
+			return nil, fmt.Errorf("write row len: %w", err)
+		}
+		if _, err := writer.Write(blob); err != nil {
+			storeFile.Close()
+			_ = os.Remove(storeFile.Name())
+			return nil, fmt.Errorf("write row blob: %w", err)
+		}
+		offset += int64(32 + 4 + len(blob))
+	}
+	if err := writer.Flush(); err != nil {
+		storeFile.Close()
+		_ = os.Remove(storeFile.Name())
+		return nil, fmt.Errorf("flush store: %w", err)
+	}
+	store := &tableStore{file: storeFile, path: storeFile.Name(), index: index}
+	if storeMmap {
+		info, err := storeFile.Stat()
+		if err == nil && info.Size() > 0 {
+			data, err := syscall.Mmap(int(storeFile.Fd()), 0, int(info.Size()), syscall.PROT_READ, syscall.MAP_SHARED)
+			if err == nil {
+				store.mmap = data
+			} else if logger.IsDebugEnabled() {
+				logger.Debug("store mmap failed: %v", err)
 			}
-			if err := tx.Commit(); err != nil {
-				return fmt.Errorf("commit: %w", err)
-			}
-			tx, stmt, err = beginSQLiteInsert(db)
-			if err != nil {
-				return fmt.Errorf("begin insert: %w", err)
-			}
-			batchCount = 0
 		}
 	}
-	if err := stmt.Close(); err != nil {
-		_ = tx.Rollback()
-		return fmt.Errorf("close stmt: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit: %w", err)
-	}
-	return nil
+	return store, nil
 }
 
-type batchItem struct {
-	pk   string
-	vals []string
-	hash []byte
+func (s *tableStore) close() {
+	if s == nil {
+		return
+	}
+	if s.mmap != nil {
+		_ = syscall.Munmap(s.mmap)
+	}
+	_ = s.file.Close()
+	_ = os.Remove(s.path)
 }
 
-// compareNewRows streams the new binary file and produces inserts/updates.
-func compareNewRows(db *sql.DB, r *bufio.Reader, columns []string, pkCols []string, result *ComparisonResult, seen map[string]struct{}, table string, fileSize int64) error {
-	pkIndex := buildPKIndex(columns, pkCols)
-	batchSize := adjustBatchByFileSize(sqliteBatchSize, fileSize)
-	if batchSize <= 0 {
-		batchSize = 512
+func (s *tableStore) lookup(pk [32]byte) (rowHash [32]byte, blob []byte, ok bool, err error) {
+	if s == nil {
+		return rowHash, nil, false, nil
 	}
-	fullQuery := buildInQuery(batchSize)
-	fullStmt, err := db.Prepare(fullQuery)
-	if err != nil {
-		return fmt.Errorf("prepare batch lookup: %w", err)
+	offset, ok := s.index[pk]
+	if !ok {
+		return rowHash, nil, false, nil
 	}
-	defer fullStmt.Close()
+	if s.mmap != nil {
+		base := int(offset)
+		if base+36 > len(s.mmap) {
+			return rowHash, nil, false, fmt.Errorf("row header out of range")
+		}
+		copy(rowHash[:], s.mmap[base:base+32])
+		blobLen := binary.LittleEndian.Uint32(s.mmap[base+32 : base+36])
+		end := base + 36 + int(blobLen)
+		if end > len(s.mmap) {
+			return rowHash, nil, false, fmt.Errorf("row blob out of range")
+		}
+		blob = make([]byte, blobLen)
+		copy(blob, s.mmap[base+36:end])
+		return rowHash, blob, true, nil
+	}
+	header := make([]byte, 36)
+	if _, err = s.file.ReadAt(header, offset); err != nil {
+		return rowHash, nil, false, fmt.Errorf("read row header: %w", err)
+	}
+	copy(rowHash[:], header[:32])
+	blobLen := binary.LittleEndian.Uint32(header[32:36])
+	blob = make([]byte, blobLen)
+	if blobLen > 0 {
+		if _, err = s.file.ReadAt(blob, offset+36); err != nil {
+			return rowHash, nil, false, fmt.Errorf("read row blob: %w", err)
+		}
+	}
+	return rowHash, blob, true, nil
+}
 
-	items := make([]batchItem, 0, batchSize)
+// compareNewRowsStore streams the new binary file and produces inserts/updates.
+func compareNewRowsStore(r *bufio.Reader, newColumns []string, oldColumns []string, pkCols []string, store *tableStore, result *ComparisonResult, seen map[[32]byte]struct{}, table string) error {
+	pkIndex := buildPKIndex(newColumns, pkCols)
+	if len(pkIndex) != len(pkCols) {
+		return fmt.Errorf("missing PK columns for table %s", table)
+	}
 	for {
 		values, err := readRowValues(r)
 		if err == io.EOF {
@@ -512,140 +636,59 @@ func compareNewRows(db *sql.DB, r *bufio.Reader, columns []string, pkCols []stri
 		if err != nil {
 			return fmt.Errorf("read row: %w", err)
 		}
-		hash := hashPKValues(values, pkIndex)
-		newHash := rowHashValues(values, columns)
-		items = append(items, batchItem{pk: hash, vals: values, hash: newHash})
-		if len(items) >= batchSize {
-			if err := compareBatch(fullStmt, items, result, seen, pkCols, columns, table); err != nil {
+		pkHash := hashPKValuesBytes(values, pkIndex)
+		if store != nil {
+			oldHash, oldBlob, ok, err := store.lookup(pkHash)
+			if err != nil {
 				return err
 			}
-			items = items[:0]
-		}
-	}
-	if len(items) > 0 {
-		stmt, err := db.Prepare(buildInQuery(len(items)))
-		if err != nil {
-			return fmt.Errorf("prepare tail lookup: %w", err)
-		}
-		if err := compareBatch(stmt, items, result, seen, pkCols, columns, table); err != nil {
-			stmt.Close()
-			return err
-		}
-		stmt.Close()
-	}
-	return nil
-}
-
-func compareBatch(stmt *sql.Stmt, items []batchItem, result *ComparisonResult, seen map[string]struct{}, pkCols []string, columns []string, table string) error {
-	args := make([]any, 0, len(items))
-	for _, it := range items {
-		args = append(args, it.pk)
-	}
-	rows, err := stmt.Query(args...)
-	if err != nil {
-		return fmt.Errorf("batch lookup: %w", err)
-	}
-	defer rows.Close()
-	oldMap := make(map[string]struct {
-		hash []byte
-		row  []byte
-	}, len(items))
-	for rows.Next() {
-		var pk string
-		var h []byte
-		var rowBlob []byte
-		if err := rows.Scan(&pk, &h, &rowBlob); err != nil {
-			return fmt.Errorf("scan batch: %w", err)
-		}
-		oldMap[pk] = struct {
-			hash []byte
-			row  []byte
-		}{hash: h, row: rowBlob}
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("batch rows: %w", err)
-	}
-	for _, it := range items {
-		if old, ok := oldMap[it.pk]; ok {
-			seen[it.pk] = struct{}{}
-			if bytes.Equal(old.hash, it.hash) {
+			if ok {
+				seen[pkHash] = struct{}{}
+				newHash := rowHashValuesBytes(values, newColumns)
+				if oldHash == newHash {
+					continue
+				}
+				oldVals, err := decodeRowValues(oldBlob)
+				if err != nil {
+					return fmt.Errorf("decode old row: %w", err)
+				}
+				oldRow := buildRowFromValues(table, oldColumns, oldVals)
+				newRow := buildRowFromValues(table, newColumns, values)
+				updates := findUpdates(oldRow, newRow)
+				if len(updates) > 0 {
+					result.Changes += fmt.Sprintf("-- TABLE %s\n", newRow.Table)
+					for col, oldVal := range updates {
+						result.Changes += fmt.Sprintf("-- %s old value: %s\n", col, oldVal)
+					}
+					result.Changes += buildUpdateStatement(newRow.Table, newRow, pkCols, updates)
+					result.Changes += "\n\n"
+					result.UpdateCount++
+				}
 				continue
 			}
-			oldVals, err := decodeRowValues(old.row)
-			if err != nil {
-				return fmt.Errorf("decode old row: %w", err)
-			}
-			oldRow := buildRowFromValues(table, columns, oldVals)
-			newRow := buildRowFromValues(table, columns, it.vals)
-			updates := findUpdates(oldRow, newRow)
-			if len(updates) > 0 {
-				result.Changes += fmt.Sprintf("-- TABLE %s\n", newRow.Table)
-				for col, oldVal := range updates {
-					result.Changes += fmt.Sprintf("-- %s old value: %s\n", col, oldVal)
-				}
-				result.Changes += buildUpdateStatement(newRow.Table, newRow, pkCols, updates)
-				result.Changes += "\n\n"
-				result.UpdateCount++
-			}
-			continue
 		}
 		result.Changes += fmt.Sprintf("-- NEW RECORD IN %s\n", table)
-		result.Changes += buildInsertFromValues(table, columns, it.vals)
+		result.Changes += buildInsertFromValues(table, newColumns, values)
 		result.Changes += "\n\n"
 		result.InsertCount++
 	}
 	return nil
 }
 
-func buildInQuery(count int) string {
-	placeholders := make([]string, count)
-	for i := range placeholders {
-		placeholders[i] = "?"
+// emitDeletionsFromStore scans old rows and emits deletions for unseen PKs.
+func emitDeletionsFromStore(store *tableStore, pkCols []string, columns []string, table string, seen map[[32]byte]struct{}, result *ComparisonResult) error {
+	if store == nil {
+		return nil
 	}
-	return fmt.Sprintf("SELECT pk_hash, row_hash, row_blob FROM rows WHERE pk_hash IN (%s)", strings.Join(placeholders, ","))
-}
-
-func adjustBatchByFileSize(base int, fileSize int64) int {
-	if base <= 0 {
-		base = 512
-	}
-	mb := float64(fileSize) / (1024.0 * 1024.0)
-	switch {
-	case mb < 64:
-		return base
-	case mb < 256:
-		return max(64, base/2)
-	case mb < 1024:
-		return max(64, base/4)
-	case mb < 4096:
-		return max(64, base/8)
-	default:
-		return max(64, base/16)
-	}
-}
-
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
-
-// emitDeletionsFromDB scans old rows and emits deletions for unseen PKs.
-func emitDeletionsFromDB(db *sql.DB, pkCols []string, columns []string, table string, seen map[string]struct{}, result *ComparisonResult) error {
-	rows, err := db.Query(`SELECT pk_hash, row_blob FROM rows`)
-	if err != nil {
-		return fmt.Errorf("query rows: %w", err)
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var hash string
-		var blob []byte
-		if err := rows.Scan(&hash, &blob); err != nil {
-			return fmt.Errorf("scan deletion: %w", err)
+	for pk := range store.index {
+		if _, ok := seen[pk]; ok {
+			continue
 		}
-		if _, ok := seen[hash]; ok {
+		_, blob, ok, err := store.lookup(pk)
+		if err != nil {
+			return err
+		}
+		if !ok {
 			continue
 		}
 		oldVals, err := decodeRowValues(blob)
@@ -653,152 +696,19 @@ func emitDeletionsFromDB(db *sql.DB, pkCols []string, columns []string, table st
 			return fmt.Errorf("decode deletion row: %w", err)
 		}
 		oldRow := buildRowFromValues(table, columns, oldVals)
-		result.Deletions += fmt.Sprintf("-- DELETED FROM %s: %s\n", table, hash)
+		result.Deletions += fmt.Sprintf("-- DELETED FROM %s: %s\n", table, hex.EncodeToString(pk[:]))
 		result.Deletions += buildDeleteStatement(table, oldRow, pkCols)
 		result.Deletions += "\n\n"
 		result.DeleteCount++
 	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("iterate rows: %w", err)
-	}
 	return nil
 }
 
-// applySQLitePragmas configures SQLite for fast, temp-file workloads.
-// These settings prioritize throughput over durability.
-func applySQLitePragmas(db *sql.DB) error {
-	pragmas := []string{
-		"PRAGMA journal_mode=OFF;",
-		"PRAGMA synchronous=OFF;",
-		"PRAGMA temp_store=MEMORY;",
-		fmt.Sprintf("PRAGMA cache_size=%d;", -sqliteCacheKB),
-		"PRAGMA page_size=32768;",
-		fmt.Sprintf("PRAGMA mmap_size=%d;", sqliteMmapMB<<20),
-		"PRAGMA busy_timeout=5000;",
-	}
-	for _, pragma := range pragmas {
-		if _, err := db.Exec(pragma); err != nil {
-			return fmt.Errorf("apply pragma %q: %w", pragma, err)
-		}
-	}
-	return nil
-}
-
-// setupSQLiteSchema creates the per-table rows table.
-// Each table DB stores only one table's rows.
-func setupSQLiteSchema(db *sql.DB) error {
-	stmts := []string{
-		`CREATE TABLE IF NOT EXISTS rows (
-			pk_hash TEXT PRIMARY KEY,
-			row_hash BLOB NOT NULL,
-			row_blob BLOB NOT NULL
-		);`,
-	}
-	for _, stmt := range stmts {
-		if _, err := db.Exec(stmt); err != nil {
-			return fmt.Errorf("create schema: %w", err)
-		}
-	}
-	return nil
-}
-
-// beginSQLiteInsert starts a transaction and returns an insert statement.
-// We batch inserts for speed and commit every sqliteBatchSize rows.
-func beginSQLiteInsert(db *sql.DB) (*sql.Tx, *sql.Stmt, error) {
-	tx, err := db.Begin()
-	if err != nil {
-		return nil, nil, err
-	}
-	stmt, err := tx.Prepare(`INSERT OR REPLACE INTO rows(pk_hash, row_hash, row_blob) VALUES(?, ?, ?)`)
-	if err != nil {
-		_ = tx.Rollback()
-		return nil, nil, err
-	}
-	return tx, stmt, nil
-}
-
-func insertRowsToSQLite(db *sql.DB, insertParser *parser.InsertParser, filename string, columns map[string][]string, pkMap map[string][]string, p *mpb.Progress) error {
-	tx, stmt, err := beginSQLiteInsert(db)
-	if err != nil {
-		return fmt.Errorf("begin insert: %w", err)
-	}
-	defer stmt.Close()
-
-	batchCount := 0
-	var firstErr error
-	pkIndexCache := make(map[string][]int)
-
-	err = insertParser.ParseInsertsStream(filename, columns, p, "", func(row *parser.InsertRow) {
-		if firstErr != nil {
-			return
-		}
-		resolved, ok := resolveTableName(pkMap, row.Table)
-		if !ok {
-			return
-		}
-		pkCols, hasPK := pkMap[resolved]
-		if !hasPK {
-			return
-		}
-		pkIndex, ok := pkIndexCache[resolved]
-		if !ok {
-			pkIndex = buildPKIndex(row.Columns, pkCols)
-			pkIndexCache[resolved] = pkIndex
-		}
-		values := make([]string, 0, len(row.Columns))
-		for _, col := range row.Columns {
-			values = append(values, row.Data[col])
-		}
-		hash := hashPKValues(values, pkIndex)
-		rh := rowHashValues(values, row.Columns)
-		blob := encodeRowValues(values)
-		if _, e := stmt.Exec(hash, rh, blob); e != nil {
-			firstErr = e
-			return
-		}
-		batchCount++
-		if batchCount >= sqliteBatchSize {
-			if e := stmt.Close(); e != nil && firstErr == nil {
-				firstErr = e
-				return
-			}
-			if e := tx.Commit(); e != nil && firstErr == nil {
-				firstErr = e
-				return
-			}
-			nextTx, nextStmt, nextErr := beginSQLiteInsert(db)
-			if nextErr != nil {
-				firstErr = nextErr
-				return
-			}
-			tx = nextTx
-			stmt = nextStmt
-			batchCount = 0
-		}
-	})
-	if err != nil {
-		_ = tx.Rollback()
-		return fmt.Errorf("parse inserts: %w", err)
-	}
-	if firstErr != nil {
-		_ = tx.Rollback()
-		return fmt.Errorf("insert rows: %w", firstErr)
-	}
-	if err := stmt.Close(); err != nil {
-		_ = tx.Rollback()
-		return fmt.Errorf("close insert stmt: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit insert: %w", err)
-	}
-	return nil
-}
-
-// compareTableSQLite compares a single table:
-// 1) load old rows into SQLite
+// compareTableStore compares a single table:
+// 1) build an on-disk hash index for old rows
 // 2) stream new rows and emit inserts/updates
 // 3) emit deletions for unseen PKs
-func compareTableSQLite(table string, pkCols []string, oldFilePath, newFilePath string) (*ComparisonResult, *TableTiming, error) {
+func compareTableStore(table string, pkCols []string, oldFilePath, newFilePath string) (*ComparisonResult, *TableTiming, error) {
 	result := &ComparisonResult{TableName: table}
 	if oldFilePath == "" && newFilePath == "" {
 		return result, &TableTiming{Table: table}, nil
@@ -806,30 +716,10 @@ func compareTableSQLite(table string, pkCols []string, oldFilePath, newFilePath 
 
 	timing := &TableTiming{Table: table}
 
-	dbFile, err := os.CreateTemp("", "sqldumpdiff_table_*.db")
-	if err != nil {
-		return nil, nil, fmt.Errorf("create temp db: %w", err)
-	}
-	dbPath := dbFile.Name()
-	dbFile.Close()
-	defer os.Remove(dbPath)
-	defer os.Remove(dbPath + "-shm")
-	defer os.Remove(dbPath + "-wal")
+	var oldColumns []string
+	var newColumns []string
+	var store *tableStore
 
-	db, err := sql.Open("sqlite3", dbPath)
-	if err != nil {
-		return nil, nil, fmt.Errorf("open sqlite: %w", err)
-	}
-	defer db.Close()
-	if err := applySQLitePragmas(db); err != nil {
-		return nil, nil, err
-	}
-	if err := setupSQLiteSchema(db); err != nil {
-		return nil, nil, err
-	}
-
-	// Load old rows into SQLite
-	var columns []string
 	if oldFilePath != "" {
 		start := time.Now()
 		cols, f, reader, err := openTableBin(oldFilePath)
@@ -837,8 +727,9 @@ func compareTableSQLite(table string, pkCols []string, oldFilePath, newFilePath 
 			return nil, nil, err
 		}
 		defer f.Close()
-		columns = cols
-		if err := loadTableBin(db, reader, columns, pkCols); err != nil {
+		oldColumns = cols
+		store, err = buildTableStoreFromReader(reader, oldColumns, pkCols)
+		if err != nil {
 			return nil, nil, err
 		}
 		timing.LoadMS = time.Since(start).Milliseconds()
@@ -846,31 +737,35 @@ func compareTableSQLite(table string, pkCols []string, oldFilePath, newFilePath 
 			logger.Debug("Timing: %s load old rows took %s", table, time.Since(start))
 		}
 	}
+	defer func() {
+		if store != nil {
+			store.close()
+		}
+	}()
 
-	seen := make(map[string]struct{})
-
-	if len(columns) == 0 && newFilePath != "" {
+	if len(oldColumns) == 0 && newFilePath != "" {
 		cols, f, _, err := openTableBin(newFilePath)
 		if err != nil {
 			return nil, nil, err
 		}
 		f.Close()
-		columns = cols
+		newColumns = cols
 	}
 
-	// Process new rows
+	seen := make(map[[32]byte]struct{})
+
 	if newFilePath != "" {
 		start := time.Now()
-		_, f, reader, err := openTableBin(newFilePath)
+		cols, f, reader, err := openTableBin(newFilePath)
 		if err != nil {
 			return nil, nil, err
 		}
 		defer f.Close()
-		fileSize := int64(0)
-		if info, err := os.Stat(newFilePath); err == nil {
-			fileSize = info.Size()
+		newColumns = cols
+		if oldColumns == nil {
+			oldColumns = newColumns
 		}
-		if err := compareNewRows(db, reader, columns, pkCols, result, seen, table, fileSize); err != nil {
+		if err := compareNewRowsStore(reader, newColumns, oldColumns, pkCols, store, result, seen, table); err != nil {
 			return nil, nil, err
 		}
 		timing.CompMS = time.Since(start).Milliseconds()
@@ -879,9 +774,8 @@ func compareTableSQLite(table string, pkCols []string, oldFilePath, newFilePath 
 		}
 	}
 
-	// Deletions
 	start := time.Now()
-	if err := emitDeletionsFromDB(db, pkCols, columns, table, seen, result); err != nil {
+	if err := emitDeletionsFromStore(store, pkCols, oldColumns, table, seen, result); err != nil {
 		return nil, nil, err
 	}
 	timing.DelMS = time.Since(start).Milliseconds()
@@ -892,21 +786,18 @@ func compareTableSQLite(table string, pkCols []string, oldFilePath, newFilePath 
 	return result, timing, nil
 }
 
-// ConfigureSQLiteTunables allows CLI to override defaults.
-// ConfigureSQLiteTunables allows the CLI to override defaults before processing.
-func ConfigureSQLiteTunables(cacheKB, mmapMB, batchSize, workers int) {
-	if cacheKB > 0 {
-		sqliteCacheKB = cacheKB
+// ConfigureStoreTunables allows the CLI to override defaults before processing.
+func ConfigureStoreTunables(readerKB, writerKB, workers int, mmap bool) {
+	if readerKB > 0 {
+		storeReaderKB = readerKB
 	}
-	if mmapMB >= 0 {
-		sqliteMmapMB = mmapMB
-	}
-	if batchSize > 0 {
-		sqliteBatchSize = batchSize
+	if writerKB > 0 {
+		storeWriterKB = writerKB
 	}
 	if workers >= 0 {
-		sqliteWorkers = workers
+		storeWorkers = workers
 	}
+	storeMmap = mmap
 }
 
 // ConfigureTiming enables timing diagnostics independent of debug logging.
@@ -932,11 +823,11 @@ func NewDeltaGenerator(pkMap, oldColumnsMap, newColumnsMap map[string][]string) 
 
 // GenerateDelta is the high-level pipeline:
 // 1) split dumps into per-table binary files
-// 2) compare tables in parallel using per-table SQLite DBs
+// 2) compare tables in parallel using per-table on-disk hash stores
 // 3) stream SQL output and return summary counts
 func (dg *DeltaGenerator) GenerateDelta(oldFile, newFile string, p *mpb.Progress, out io.Writer) (Summary, *TimingMeta, error) {
 	logger.Debug("GenerateDelta: Starting delta generation")
-	tmpDir, err := os.MkdirTemp("", "sqldumpdiff-sqlite-*")
+	tmpDir, err := os.MkdirTemp("", "sqldumpdiff-*")
 	if err != nil {
 		return Summary{}, nil, fmt.Errorf("create temp dir: %w", err)
 	}
@@ -957,6 +848,13 @@ func (dg *DeltaGenerator) GenerateDelta(oldFile, newFile string, p *mpb.Progress
 	newTableFiles := make(map[string]string)
 	var splitErr error
 	var mu sync.Mutex
+
+	// Split phase benefits from higher concurrency than compare phase.
+	splitWorkers := runtime.NumCPU() * 2
+	if storeWorkers > 0 {
+		splitWorkers = max(storeWorkers, splitWorkers)
+	}
+	prevProcs := runtime.GOMAXPROCS(splitWorkers)
 
 	wg := sync.WaitGroup{}
 	wg.Add(2)
@@ -983,6 +881,7 @@ func (dg *DeltaGenerator) GenerateDelta(oldFile, newFile string, p *mpb.Progress
 		mu.Unlock()
 	}()
 	wg.Wait()
+	runtime.GOMAXPROCS(prevProcs)
 	if splitErr != nil {
 		return Summary{}, nil, splitErr
 	}
@@ -1010,9 +909,6 @@ func (dg *DeltaGenerator) GenerateDelta(oldFile, newFile string, p *mpb.Progress
 	var writeIOMS int64
 
 	maxWorkers := runtime.NumCPU()
-	if sqliteWorkers > 0 {
-		maxWorkers = sqliteWorkers
-	}
 	sem := make(chan struct{}, maxWorkers)
 
 	var compareBar *mpb.Bar
@@ -1045,7 +941,7 @@ func (dg *DeltaGenerator) GenerateDelta(oldFile, newFile string, p *mpb.Progress
 			defer compareWg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			res, timing, err := compareTableSQLite(tbl, pk, oldFilePath, newFilePath)
+			res, timing, err := compareTableStore(tbl, pk, oldFilePath, newFilePath)
 			if err != nil {
 				logger.Error("GenerateDelta: Table %s compare error: %v", tbl, err)
 				return
