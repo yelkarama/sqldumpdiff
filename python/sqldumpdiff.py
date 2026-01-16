@@ -12,6 +12,7 @@ import argparse
 import time
 import yaml
 from tqdm import tqdm
+from blake3 import blake3
 
 # Wall-clock start time (module import time) for total runtime measurement.
 _WALL_START = time.monotonic()
@@ -582,7 +583,10 @@ def _process_table(args):
 
 def _sanitize_filename(name):
     """Sanitize table name for use in filename."""
-    return re.sub(r'[^A-Za-z0-9_.-]+', '_', name)
+    safe = re.sub(r'[^A-Za-z0-9_.-]+', '_', name)
+    # Add a short BLAKE3 suffix to avoid collisions between similar names.
+    suffix = blake3(name.encode("utf-8")).hexdigest(length=8)
+    return f"{safe}_{suffix}"
 
 
 def _process_insert_for_split(args):
@@ -801,8 +805,8 @@ def generate_delta(old_file, new_file, delta_out=None, debug=False, timing=False
                 old_table_files = old_future.result()
                 new_table_files = new_future.result()
             split_ms = int((time.monotonic() - t_split_start) * 1000)
-                if debug or timing:
-                    print(f"[DEBUG] Timing: split dumps took {split_ms}ms", file=sys.stderr)
+            if debug or timing:
+                print(f"[DEBUG] Timing: split dumps took {split_ms}ms", file=sys.stderr)
 
             tables_to_process = sorted(set(old_table_files.keys()) | set(new_table_files.keys()))
             if not tables_to_process:
