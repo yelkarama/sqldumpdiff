@@ -10,7 +10,7 @@ mod progress;
 use clap::{CommandFactory, Parser};
 use serde_json;
 use serde_yaml;
-use comparer::{DeltaGenerator, SqliteTunables};
+use comparer::{DeltaGenerator, StoreTunables};
 use parser::schema::SchemaParser;
 use std::fs::File;
 use std::io::{self, Write};
@@ -26,12 +26,20 @@ struct Args {
     #[arg(long)]
     debug: bool,
 
-    /// SQLite tuning profile name (low-mem, balanced, fast).
+    /// Store tuning profile name (low-mem, balanced, fast).
     #[arg(long, default_value = "fast")]
+    store_profile: String,
+
+    /// Store profiles YAML file.
+    #[arg(long, default_value = "store_profiles.yaml")]
+    store_profile_file: String,
+
+    /// Deprecated: use --store-profile.
+    #[arg(long, default_value = "")]
     sqlite_profile: String,
 
-    /// SQLite profiles YAML file.
-    #[arg(long, default_value = "sqlite_profiles.yaml")]
+    /// Deprecated: use --store-profile-file.
+    #[arg(long, default_value = "")]
     sqlite_profile_file: String,
 
     /// Emit timing diagnostics even without --debug.
@@ -53,16 +61,16 @@ struct Args {
 }
 
 #[derive(Debug, serde::Deserialize)]
-struct SqliteProfilesFile {
-    profiles: std::collections::HashMap<String, SqliteProfile>,
+struct StoreProfilesFile {
+    profiles: std::collections::HashMap<String, StoreProfile>,
 }
 
 #[derive(Debug, serde::Deserialize, Clone)]
-struct SqliteProfile {
-    cache_kb: i64,
-    mmap_mb: i64,
-    batch: usize,
+struct StoreProfile {
+    reader_kb: usize,
+    writer_kb: usize,
     workers: usize,
+    mmap: bool,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -146,23 +154,42 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         old_pk.insert(table, pk);
     }
 
-    // Load SQLite profiles from YAML and apply the selected profile first.
-    let profiles: SqliteProfilesFile = {
-        let yaml = std::fs::read_to_string(&args.sqlite_profile_file)?;
+    // Load store profiles from YAML and apply the selected profile first.
+    let profile_name = if !args.sqlite_profile.is_empty() {
+        args.sqlite_profile.clone()
+    } else {
+        args.store_profile.clone()
+    };
+    let profile_file = if !args.sqlite_profile_file.is_empty() {
+        args.sqlite_profile_file.clone()
+    } else {
+        args.store_profile_file.clone()
+    };
+    let profiles: StoreProfilesFile = {
+        let yaml = match std::fs::read_to_string(&profile_file) {
+            Ok(data) => data,
+            Err(e) => {
+                if profile_file == "sqlite_profiles.yaml" {
+                    std::fs::read_to_string("store_profiles.yaml")?
+                } else {
+                    return Err(e.into());
+                }
+            }
+        };
         serde_yaml::from_str(&yaml)?
     };
     let profile = profiles
         .profiles
-        .get(&args.sqlite_profile)
+        .get(&profile_name)
         .cloned()
-        .ok_or_else(|| format!("Invalid --sqlite-profile '{}'", args.sqlite_profile))?;
+        .ok_or_else(|| format!("Invalid profile '{}'", profile_name))?;
 
     // Apply profile defaults.
-    let tunables = SqliteTunables {
-        cache_kb: profile.cache_kb,
-        mmap_mb: profile.mmap_mb,
-        batch_size: profile.batch,
+    let tunables = StoreTunables {
+        reader_kb: profile.reader_kb,
+        writer_kb: profile.writer_kb,
         workers: profile.workers,
+        mmap: profile.mmap,
     };
 
     let generator = DeltaGenerator::new(old_pk, old_cols, new_cols, tunables, args.timing);

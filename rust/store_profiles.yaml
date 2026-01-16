@@ -1,0 +1,16 @@
+profiles:
+  low-mem:
+    reader_kb: 256
+    writer_kb: 256
+    workers: 4
+    mmap: false
+  balanced:
+    reader_kb: 1024
+    writer_kb: 1024
+    workers: 0
+    mmap: true
+  fast:
+    reader_kb: 4096
+    writer_kb: 4096
+    workers: 0
+    mmap: true

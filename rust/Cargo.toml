@@ -12,11 +12,11 @@ serde_yaml = "0.9"
 blake3 = "1.5"
 indicatif = "0.18"
 rayon = "1.10"
-rusqlite = { version = "0.38", features = ["bundled"] }
 tempfile = "3.10"
 hex = "0.4"
 num_cpus = "1.16"
 ahash = "0.8"
+memmap2 = "0.9"
 
 
 [profile.release]

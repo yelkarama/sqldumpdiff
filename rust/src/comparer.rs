@@ -1,19 +1,23 @@
-// Comparison pipeline: split dumps into per-table JSONL, then compare via SQLite.
+// Comparison pipeline: split dumps into per-table binary files, then compare via store.
 // This mirrors the Go implementation closely for consistent behavior.
 
 use crate::logger;
 use crate::parser::insert::InsertParser;
 use crate::parser::InsertRow;
 use rayon::prelude::*;
-use rusqlite::{params, Connection, OptionalExtension};
 use ahash::AHashSet;
 use blake3;
+use memmap2::Mmap;
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, atomic::{AtomicU64, Ordering}};
 use std::time::Instant;
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
+#[cfg(windows)]
+use std::os::windows::fs::FileExt;
 
 pub struct ComparisonResult {
     pub changes: String,
@@ -45,22 +49,22 @@ pub struct Summary {
     pub delete_count: usize,
 }
 
-// SQLite tuning knobs (mirrors Go defaults).
+// Store tuning knobs (mirrors Go defaults).
 #[derive(Clone, Copy)]
-pub struct SqliteTunables {
-    pub cache_kb: i64,
-    pub mmap_mb: i64,
-    pub batch_size: usize,
+pub struct StoreTunables {
+    pub reader_kb: usize,
+    pub writer_kb: usize,
     pub workers: usize,
+    pub mmap: bool,
 }
 
-impl Default for SqliteTunables {
+impl Default for StoreTunables {
     fn default() -> Self {
         Self {
-            cache_kb: 800_000,
-            mmap_mb: 128,
-            batch_size: 20_000,
+            reader_kb: 1024,
+            writer_kb: 1024,
             workers: 0,
+            mmap: true,
         }
     }
 }
@@ -69,7 +73,7 @@ pub struct DeltaGenerator {
     pk_map: HashMap<String, Vec<String>>,
     old_columns: HashMap<String, Vec<String>>,
     new_columns: HashMap<String, Vec<String>>,
-    tunables: SqliteTunables,
+    tunables: StoreTunables,
     timing_enabled: bool,
 }
 
@@ -89,7 +93,7 @@ impl DeltaGenerator {
         pk_map: HashMap<String, Vec<String>>,
         old_columns: HashMap<String, Vec<String>>,
         new_columns: HashMap<String, Vec<String>>,
-        tunables: SqliteTunables,
+        tunables: StoreTunables,
         timing_enabled: bool,
     ) -> Self {
         Self {
@@ -150,6 +154,7 @@ impl DeltaGenerator {
         let new_files_clone = Arc::clone(&new_files);
         let split_err_clone = Arc::clone(&split_err);
         let split_err_clone_new = Arc::clone(&split_err);
+        let writer_kb = self.tunables.writer_kb;
 
         // Run split in parallel for old/new.
         let old_handle = std::thread::spawn({
@@ -166,6 +171,7 @@ impl DeltaGenerator {
                     "old",
                     &progress,
                     "Parsing old dump",
+                    writer_kb,
                 );
                 match res {
                     Ok(map) => {
@@ -208,6 +214,7 @@ impl DeltaGenerator {
                     "new",
                     &progress,
                     "Parsing new dump",
+                    writer_kb,
                 );
                 match res {
                     Ok(map) => {
@@ -303,7 +310,7 @@ impl DeltaGenerator {
                 let old_path = old_map.get(table).cloned().unwrap_or_default();
                 let new_path = new_map.get(table).cloned().unwrap_or_default();
 
-                match compare_table_sqlite(
+                match compare_table_store(
                     table,
                     &pk_cols,
                     &old_path,
@@ -444,6 +451,7 @@ fn split_dump_by_table(
     label: &str,
     progress: &crate::progress::ProgressManager,
     progress_label: &str,
+    writer_kb: usize,
 ) -> Result<HashMap<String, String>, Box<dyn std::error::Error + Send + Sync>> {
     let insert_parser = InsertParser::new();
 
@@ -469,13 +477,21 @@ fn split_dump_by_table(
                     return;
                 }
             };
+            let pk_cols = match pk_map.get(&resolved) {
+                Some(cols) => cols,
+                None => return,
+            };
+            if !row_has_pk(&row, pk_cols) {
+                return;
+            }
 
             let writer = writers.entry(resolved.clone()).or_insert_with(|| {
                 let name = sanitize_filename(&resolved);
                 let path = tmp_dir.join(format!("{}_{}.bin", label, name));
-                let file = File::create(&path).expect("create temp jsonl");
+                let file = File::create(&path).expect("create temp table file");
                 table_paths.insert(resolved.clone(), path.to_string_lossy().to_string());
-                let mut w = BufWriter::new(file);
+                let cap = std::cmp::max(1024 * 1024, writer_kb * 1024);
+                let mut w = BufWriter::with_capacity(cap, file);
                 // Write header once per table (columns are stable for the table).
                 if let Err(e) = write_table_header(&mut w, &row.columns) {
                     logger::debug(&format!("splitDumpByTable: failed to write header: {}", e));
@@ -562,13 +578,178 @@ fn sanitize_filename(name: &str) -> String {
     format!("{}_{}", out, hex::encode(&sum.as_bytes()[..4]))
 }
 
-// Compare a single table using a per-table SQLite database.
-fn compare_table_sqlite(
+fn row_has_pk(row: &InsertRow, pk_cols: &[String]) -> bool {
+    for col in pk_cols {
+        if row.data.contains_key(col) {
+            continue;
+        }
+        let target = col.to_lowercase();
+        let mut found = false;
+        for key in row.data.keys() {
+            if key.to_lowercase() == target {
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            return false;
+        }
+    }
+    true
+}
+
+struct TableStore {
+    file: File,
+    path: std::path::PathBuf,
+    index: HashMap<[u8; 32], u64>,
+    mmap: Option<Mmap>,
+}
+
+impl TableStore {
+    fn lookup(&self, pk: [u8; 32]) -> Result<Option<([u8; 32], Vec<u8>)>, Box<dyn std::error::Error + Send + Sync>> {
+        let offset = match self.index.get(&pk) {
+            Some(off) => *off as usize,
+            None => return Ok(None),
+        };
+        if let Some(mmap) = &self.mmap {
+            if offset + 36 > mmap.len() {
+                return Err("row header out of range".into());
+            }
+            let mut row_hash = [0u8; 32];
+            row_hash.copy_from_slice(&mmap[offset..offset + 32]);
+            let len = u32::from_le_bytes(mmap[offset + 32..offset + 36].try_into()?);
+            let end = offset + 36 + len as usize;
+            if end > mmap.len() {
+                return Err("row blob out of range".into());
+            }
+            let blob = mmap[offset + 36..end].to_vec();
+            return Ok(Some((row_hash, blob)));
+        }
+        let mut header = [0u8; 36];
+        self.file.read_at(&mut header, offset as u64)?;
+        let mut row_hash = [0u8; 32];
+        row_hash.copy_from_slice(&header[..32]);
+        let len = u32::from_le_bytes(header[32..36].try_into()?);
+        let mut blob = vec![0u8; len as usize];
+        if len > 0 {
+            self.file.read_at(&mut blob, offset as u64 + 36)?;
+        }
+        Ok(Some((row_hash, blob)))
+    }
+
+    fn close(self) {
+        if let Some(mmap) = self.mmap {
+            drop(mmap);
+        }
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn build_pk_index(columns: &[String], pk_cols: &[String]) -> Result<Vec<usize>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut idx = Vec::with_capacity(pk_cols.len());
+    for pk in pk_cols {
+        let mut found = None;
+        for (i, col) in columns.iter().enumerate() {
+            if col.eq_ignore_ascii_case(pk) {
+                found = Some(i);
+                break;
+            }
+        }
+        match found {
+            Some(i) => idx.push(i),
+            None => return Err(format!("missing PK column '{}' in table columns", pk).into()),
+        }
+    }
+    Ok(idx)
+}
+
+fn hash_pk_values_bytes(values: &[String], pk_index: &[usize]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    for (i, idx) in pk_index.iter().enumerate() {
+        if i > 0 {
+            hasher.update(b"|");
+        }
+        let val = values.get(*idx).cloned().unwrap_or_default();
+        let norm = normalize_null(&val);
+        hasher.update(norm.as_bytes());
+    }
+    *hasher.finalize().as_bytes()
+}
+
+fn row_hash_values_bytes(values: &[String], columns: &[String]) -> [u8; 32] {
+    let mut map: HashMap<String, String> = HashMap::with_capacity(columns.len());
+    for (i, col) in columns.iter().enumerate() {
+        let key = col.to_lowercase();
+        let val = values.get(i).cloned().unwrap_or_default();
+        map.insert(key, normalize_null(&val));
+    }
+    let mut keys: Vec<String> = map.keys().cloned().collect();
+    keys.sort();
+    let mut hasher = blake3::Hasher::new();
+    for key in keys {
+        hasher.update(key.as_bytes());
+        hasher.update(b"=");
+        let val = map.get(&key).cloned().unwrap_or_default();
+        hasher.update(val.as_bytes());
+        hasher.update(b";");
+    }
+    *hasher.finalize().as_bytes()
+}
+
+fn build_table_store(
+    reader: &mut BufReader<File>,
+    columns: &[String],
+    pk_cols: &[String],
+    tunables: StoreTunables,
+) -> Result<TableStore, Box<dyn std::error::Error + Send + Sync>> {
+    let pk_index = build_pk_index(columns, pk_cols)?;
+    let store_file = tempfile::Builder::new()
+        .prefix("sqldumpdiff_store_")
+        .suffix(".bin")
+        .tempfile()?;
+    let path = store_file.path().to_path_buf();
+    let mut file = store_file.into_file();
+
+    let cap = std::cmp::max(1024 * 1024, tunables.writer_kb * 1024);
+    let mut index: HashMap<[u8; 32], u64> = HashMap::new();
+    let mut offset: u64 = 0;
+    {
+        let mut writer = BufWriter::with_capacity(cap, &mut file);
+
+    while let Some(values) = read_row_values(reader)? {
+        let pk_hash = hash_pk_values_bytes(&values, &pk_index);
+        let row_hash = row_hash_values_bytes(&values, columns);
+        let blob = encode_row_values(&values);
+        index.insert(pk_hash, offset);
+        writer.write_all(&row_hash)?;
+        writer.write_all(&(blob.len() as u32).to_le_bytes())?;
+        writer.write_all(&blob)?;
+        offset += 32 + 4 + blob.len() as u64;
+    }
+        writer.flush()?;
+    }
+
+    let mmap = if tunables.mmap {
+        let len = file.metadata()?.len();
+        if len > 0 {
+            unsafe { Some(Mmap::map(&file)?) }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    Ok(TableStore { file, path, index, mmap })
+}
+
+// Compare a single table using a per-table on-disk store.
+fn compare_table_store(
     table: &str,
     pk_cols: &[String],
     old_path: &str,
     new_path: &str,
-    tunables: SqliteTunables,
+    tunables: StoreTunables,
     timing_enabled: bool,
 ) -> Result<(ComparisonResult, TableTiming), Box<dyn std::error::Error + Send + Sync>> {
     let mut result = ComparisonResult {
@@ -591,17 +772,6 @@ fn compare_table_sqlite(
         ));
     }
 
-    let db_file = tempfile::Builder::new()
-        .prefix("sqldumpdiff_table_")
-        .suffix(".db")
-        .tempfile()?;
-    let db_path = db_file.path().to_path_buf();
-    drop(db_file);
-
-    let mut conn = Connection::open(&db_path)?;
-    apply_sqlite_pragmas(&conn, tunables)?;
-    setup_sqlite_schema(&conn)?;
-
     let mut timing = TableTiming {
         table: table.to_string(),
         load_ms: 0,
@@ -609,13 +779,16 @@ fn compare_table_sqlite(
         delete_ms: 0,
     };
 
-    let mut columns: Vec<String> = Vec::new();
+    let mut old_columns: Vec<String> = Vec::new();
+    #[allow(unused_assignments)]
+    let mut new_columns: Vec<String> = Vec::new();
+    let mut store: Option<TableStore> = None;
 
     if !old_path.is_empty() {
         let load_start = Instant::now();
-        let (cols, mut reader) = open_table_bin(old_path)?;
-        columns = cols.clone();
-        load_table_bin(&mut conn, &mut reader, &columns, pk_cols, tunables.batch_size)?;
+        let (cols, mut reader) = open_table_bin(old_path, tunables.reader_kb)?;
+        old_columns = cols.clone();
+        store = Some(build_table_store(&mut reader, &old_columns, pk_cols, tunables)?);
         timing.load_ms = load_start.elapsed().as_millis();
         if timing_enabled || logger::is_debug() {
             logger::debug(&format!(
@@ -626,26 +799,22 @@ fn compare_table_sqlite(
         }
     }
 
-    let mut seen: AHashSet<String> = AHashSet::new();
-
-    if columns.is_empty() && !new_path.is_empty() {
-        // Old file missing: pull columns from new file header.
-        let (cols, _reader) = open_table_bin(new_path)?;
-        columns = cols;
-    }
+    let mut seen: AHashSet<[u8; 32]> = AHashSet::new();
 
     if !new_path.is_empty() {
         let compare_start = Instant::now();
-        let (_cols, mut reader) = open_table_bin(new_path)?;
-        let file_size = std::fs::metadata(new_path).map(|m| m.len()).unwrap_or(0);
-        let batch_hint = adjust_batch_by_file_size(tunables.batch_size, file_size);
-        compare_new_rows(
-            &conn,
+        let (cols, mut reader) = open_table_bin(new_path, tunables.reader_kb)?;
+        new_columns = cols;
+        if old_columns.is_empty() {
+            old_columns = new_columns.clone();
+        }
+        compare_new_rows_store(
             table,
             &mut reader,
-            &columns,
+            &new_columns,
+            &old_columns,
             pk_cols,
-            batch_hint,
+            store.as_ref(),
             &mut result,
             &mut seen,
         )?;
@@ -660,7 +829,7 @@ fn compare_table_sqlite(
     }
 
     let delete_start = Instant::now();
-    emit_deletions(&conn, table, &columns, pk_cols, &mut result, &seen)?;
+    emit_deletions_store(store.as_ref(), table, &old_columns, pk_cols, &mut result, &seen)?;
     timing.delete_ms = delete_start.elapsed().as_millis();
     if timing_enabled || logger::is_debug() {
         logger::debug(&format!(
@@ -670,401 +839,100 @@ fn compare_table_sqlite(
         ));
     }
 
-    // Clean up temp DB files (best effort).
-    let _ = fs::remove_file(&db_path);
-    let _ = fs::remove_file(db_path.with_extension("db-shm"));
-    let _ = fs::remove_file(db_path.with_extension("db-wal"));
+    if let Some(store) = store {
+        store.close();
+    }
 
     Ok((result, timing))
 }
-
-// Load old rows into SQLite from the binary table file.
-fn load_table_bin(
-    conn: &mut Connection,
-    reader: &mut BufReader<File>,
-    columns: &[String],
-    pk_cols: &[String],
-    batch_size: usize,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut tx = conn.transaction()?;
-    let mut stmt = tx.prepare_cached(
-        "INSERT OR REPLACE INTO rows(pk_hash, row_hash, row_blob) VALUES(?1, ?2, ?3)",
-    )?;
-
-    let mut batch = 0usize;
-    while let Some(values) = read_row_values(reader)? {
-        let row = build_row_from_values("", columns, &values);
-        let pk = hash_pk(&row, pk_cols);
-        let rh = row_hash(&row);
-        let blob = encode_row_values(&values);
-        stmt.execute(params![pk, rh, blob])?;
-        batch += 1;
-        if batch >= batch_size {
-            drop(stmt);
-            tx.commit()?;
-            tx = conn.transaction()?;
-            stmt = tx.prepare_cached(
-                "INSERT OR REPLACE INTO rows(pk_hash, row_hash, row_blob) VALUES(?1, ?2, ?3)",
-            )?;
-            batch = 0;
-        }
-    }
-
-    drop(stmt);
-    tx.commit()?;
-    Ok(())
-}
-
-// Compare new rows to old rows stored in SQLite.
-fn compare_new_rows(
-    conn: &Connection,
+// Compare new rows to old rows stored in the on-disk store.
+fn compare_new_rows_store(
     table: &str,
     reader: &mut BufReader<File>,
-    columns: &[String],
+    new_columns: &[String],
+    old_columns: &[String],
     pk_cols: &[String],
-    batch_hint: usize,
+    store: Option<&TableStore>,
     result: &mut ComparisonResult,
-    seen: &mut AHashSet<String>,
+    seen: &mut AHashSet<[u8; 32]>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let batch = compute_compare_batch_size(conn, batch_hint)?;
-    // Prepare a statement for full batches to avoid re-preparing each time.
-    let full_sql = build_in_query(batch);
-    let mut full_stmt = conn.prepare(&full_sql)?;
-    let mut pending: Vec<(String, Vec<String>)> = Vec::with_capacity(batch);
-    let mut pending_keys: Vec<String> = Vec::with_capacity(batch);
-
+    let pk_index = build_pk_index(new_columns, pk_cols)?;
     while let Some(values) = read_row_values(reader)? {
-        let new_row = build_row_from_values(table, columns, &values);
-        let pk = hash_pk(&new_row, pk_cols);
-
-        pending_keys.push(pk);
-        pending.push((new_row.table.clone(), values));
-
-        if pending.len() >= batch {
-            compare_batch_prepared(
-                &mut full_stmt,
-                table,
-                columns,
-                pk_cols,
-                &pending,
-                &pending_keys,
-                result,
-                seen,
-            )?;
-            pending.clear();
-            pending_keys.clear();
-        }
-    }
-
-    if !pending.is_empty() {
-        compare_batch_once(
-            conn,
-            table,
-            columns,
-            pk_cols,
-            &pending,
-            &pending_keys,
-            result,
-            seen,
-        )?;
-    }
-
-    Ok(())
-}
-
-fn compare_batch_prepared(
-    stmt: &mut rusqlite::Statement<'_>,
-    table: &str,
-    columns: &[String],
-    pk_cols: &[String],
-    pending: &[(String, Vec<String>)],
-    pending_keys: &[String],
-    result: &mut ComparisonResult,
-    seen: &mut AHashSet<String>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if pending.is_empty() {
-        return Ok(());
-    }
-    let params = rusqlite::params_from_iter(pending_keys.iter());
-    let mut rows = stmt.query(params)?;
-
-    let mut old_map: HashMap<String, (Vec<u8>, Vec<u8>)> = HashMap::new();
-    while let Some(row) = rows.next()? {
-        let pk: String = row.get(0)?;
-        let h: Vec<u8> = row.get(1)?;
-        let blob: Vec<u8> = row.get(2)?;
-        old_map.insert(pk, (h, blob));
-    }
-
-    for (idx, (_tbl, values)) in pending.iter().enumerate() {
-        let pk = &pending_keys[idx];
-        if let Some((old_hash, old_blob)) = old_map.get(pk) {
-            seen.insert(pk.clone());
-            let new_hash = row_hash_values(values, columns);
-            if old_hash == &new_hash {
-                continue;
-            }
-            let new_row = build_row_from_values(table, columns, values);
-            let old_values = decode_row_values(old_blob)?;
-            let old_row = build_row_from_values(table, columns, &old_values);
-            let updates = find_updates(&old_row, &new_row);
-            if !updates.is_empty() {
-                result.changes.push_str(&format!("-- TABLE {}\n", new_row.table));
-                for (col, old_val) in &updates {
+        let pk_hash = hash_pk_values_bytes(&values, &pk_index);
+        if let Some(store) = store {
+            if let Some((old_hash, old_blob)) = store.lookup(pk_hash)? {
+                seen.insert(pk_hash);
+                let new_hash = row_hash_values_bytes(&values, new_columns);
+                if old_hash == new_hash {
+                    continue;
+                }
+                let old_values = decode_row_values(&old_blob)?;
+                let old_row = build_row_from_values(table, old_columns, &old_values);
+                let new_row = build_row_from_values(table, new_columns, &values);
+                let updates = find_updates(&old_row, &new_row);
+                if !updates.is_empty() {
+                    result.changes.push_str(&format!("-- TABLE {}\n", new_row.table));
+                    for (col, old_val) in &updates {
+                        result
+                            .changes
+                            .push_str(&format!("-- {} old value: {}\n", col, old_val));
+                    }
                     result
                         .changes
-                        .push_str(&format!("-- {} old value: {}\n", col, old_val));
+                        .push_str(&build_update_statement(&new_row, pk_cols, &updates));
+                    result.changes.push_str("\n\n");
+                    result.update_count += 1;
                 }
-                result
-                    .changes
-                    .push_str(&build_update_statement(&new_row, pk_cols, &updates));
-                result.changes.push_str("\n\n");
-                result.update_count += 1;
-            }
-        } else {
-            let new_row = build_row_from_values(table, columns, values);
-            result
-                .changes
-                .push_str(&format!("-- NEW RECORD IN {}\n", new_row.table));
-            result
-                .changes
-                .push_str(&build_insert_statement(&new_row));
-            result.changes.push_str("\n\n");
-            result.insert_count += 1;
-        }
-    }
-
-    Ok(())
-}
-
-fn compare_batch_once(
-    conn: &Connection,
-    table: &str,
-    columns: &[String],
-    pk_cols: &[String],
-    pending: &[(String, Vec<String>)],
-    pending_keys: &[String],
-    result: &mut ComparisonResult,
-    seen: &mut AHashSet<String>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if pending.is_empty() {
-        return Ok(());
-    }
-    let sql = build_in_query(pending_keys.len());
-    let mut stmt = conn.prepare(&sql)?;
-    let params = rusqlite::params_from_iter(pending_keys.iter());
-    let mut rows = stmt.query(params)?;
-
-    let mut old_map: HashMap<String, (Vec<u8>, Vec<u8>)> = HashMap::new();
-    while let Some(row) = rows.next()? {
-        let pk: String = row.get(0)?;
-        let h: Vec<u8> = row.get(1)?;
-        let blob: Vec<u8> = row.get(2)?;
-        old_map.insert(pk, (h, blob));
-    }
-
-    for (idx, (_tbl, values)) in pending.iter().enumerate() {
-        let pk = &pending_keys[idx];
-        if let Some((old_hash, old_blob)) = old_map.get(pk) {
-            seen.insert(pk.clone());
-            let new_hash = row_hash_values(values, columns);
-            if old_hash == &new_hash {
                 continue;
             }
-            let new_row = build_row_from_values(table, columns, values);
-            let old_values = decode_row_values(old_blob)?;
-            let old_row = build_row_from_values(table, columns, &old_values);
-            let updates = find_updates(&old_row, &new_row);
-            if !updates.is_empty() {
-                result.changes.push_str(&format!("-- TABLE {}\n", new_row.table));
-                for (col, old_val) in &updates {
-                    result
-                        .changes
-                        .push_str(&format!("-- {} old value: {}\n", col, old_val));
-                }
-                result
-                    .changes
-                    .push_str(&build_update_statement(&new_row, pk_cols, &updates));
-                result.changes.push_str("\n\n");
-                result.update_count += 1;
-            }
-        } else {
-            let new_row = build_row_from_values(table, columns, values);
-            result
-                .changes
-                .push_str(&format!("-- NEW RECORD IN {}\n", new_row.table));
-            result
-                .changes
-                .push_str(&build_insert_statement(&new_row));
-            result.changes.push_str("\n\n");
-            result.insert_count += 1;
         }
+        let new_row = build_row_from_values(table, new_columns, &values);
+        result
+            .changes
+            .push_str(&format!("-- NEW RECORD IN {}\n", new_row.table));
+        result
+            .changes
+            .push_str(&build_insert_statement(&new_row));
+        result.changes.push_str("\n\n");
+        result.insert_count += 1;
     }
-
     Ok(())
-}
-
-fn build_in_query(count: usize) -> String {
-    let mut placeholders = String::new();
-    for i in 0..count {
-        if i > 0 {
-            placeholders.push(',');
-        }
-        placeholders.push('?');
-    }
-    format!(
-        "SELECT pk_hash, row_hash, row_blob FROM rows WHERE pk_hash IN ({})",
-        placeholders
-    )
-}
-
-fn compute_compare_batch_size(
-    conn: &Connection,
-    batch_hint: usize,
-) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-    let max_vars: Option<i64> = conn
-        .query_row("PRAGMA max_variable_number;", [], |row| row.get(0))
-        .optional()?;
-    // For "IN (?)" we need one variable per PK. Fallback if PRAGMA unsupported.
-    let mut cap = match max_vars {
-        Some(v) if v > 0 => v as usize,
-        _ => 512,
-    };
-    if cap > 1 {
-        cap -= 1;
-    }
-    let hint = if batch_hint > 0 { batch_hint } else { 512 };
-    Ok(std::cmp::max(1, std::cmp::min(hint, cap)))
-}
-
-fn adjust_batch_by_file_size(base: usize, file_size_bytes: u64) -> usize {
-    // Scale batch down for large tables to limit memory spikes.
-    let mb = file_size_bytes as f64 / (1024.0 * 1024.0);
-    let scaled = if mb < 64.0 {
-        base
-    } else if mb < 256.0 {
-        base.saturating_mul(1) / 2
-    } else if mb < 1024.0 {
-        base.saturating_mul(1) / 4
-    } else if mb < 4096.0 {
-        base.saturating_mul(1) / 8
-    } else {
-        base.saturating_mul(1) / 16
-    };
-    std::cmp::max(64, scaled)
 }
 
 // Emit deletions for rows not seen in new file.
-fn emit_deletions(
-    conn: &Connection,
+fn emit_deletions_store(
+    store: Option<&TableStore>,
     table: &str,
     columns: &[String],
     pk_cols: &[String],
     result: &mut ComparisonResult,
-    seen: &AHashSet<String>,
+    seen: &AHashSet<[u8; 32]>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut stmt = conn.prepare("SELECT pk_hash, row_blob FROM rows")?;
-    let mut rows = stmt.query([])?;
-    while let Some(row) = rows.next()? {
-        let pk_hash: String = row.get(0)?;
-        let row_blob: Vec<u8> = row.get(1)?;
-        if seen.contains(&pk_hash) {
+    let store = match store {
+        Some(s) => s,
+        None => return Ok(()),
+    };
+    for (pk, _) in &store.index {
+        if seen.contains(pk) {
             continue;
         }
-        let values = decode_row_values(&row_blob)?;
-        let old_row = build_row_from_values(table, columns, &values);
-        result
-            .deletions
-            .push_str(&format!("-- DELETED FROM {}: {}\n", old_row.table, pk_hash));
-        result
-            .deletions
-            .push_str(&build_delete_statement(&old_row, pk_cols));
-        result.deletions.push_str("\n\n");
-        result.delete_count += 1;
+        if let Some((_hash, blob)) = store.lookup(*pk)? {
+            let values = decode_row_values(&blob)?;
+            let old_row = build_row_from_values(table, columns, &values);
+            result
+                .deletions
+                .push_str(&format!("-- DELETED FROM {}: {}\n", old_row.table, hex::encode(pk)));
+            result
+                .deletions
+                .push_str(&build_delete_statement(&old_row, pk_cols));
+            result.deletions.push_str("\n\n");
+            result.delete_count += 1;
+        }
     }
     Ok(())
-}
-
-// SQLite pragmas tuned for speed (not durability).
-fn apply_sqlite_pragmas(
-    conn: &Connection,
-    tunables: SqliteTunables,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Use execute_batch to avoid errors for PRAGMAs that return rows.
-    let cache_stmt = format!("PRAGMA cache_size={};", -tunables.cache_kb);
-    let mmap_stmt = format!("PRAGMA mmap_size={};", tunables.mmap_mb << 20);
-    let sql = format!(
-        "PRAGMA journal_mode=OFF;\
-         PRAGMA synchronous=OFF;\
-         PRAGMA temp_store=MEMORY;\
-         {}\
-         PRAGMA page_size=32768;\
-         {}\
-         PRAGMA busy_timeout=5000;",
-        cache_stmt, mmap_stmt
-    );
-    conn.execute_batch(&sql)?;
-    Ok(())
-}
-
-// Create the schema for per-table DB.
-fn setup_sqlite_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // We don't need Send/Sync here, but keep error types consistent.
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS rows (\
-            pk_hash TEXT PRIMARY KEY,\
-            row_hash BLOB NOT NULL,\
-            row_blob BLOB NOT NULL\
-        );",
-        [],
-    )?;
-    Ok(())
-}
-
-// Compute row hash using column order.
-fn row_hash(row: &InsertRow) -> Vec<u8> {
-    let mut hasher = blake3::Hasher::new();
-    for col in &row.columns {
-        // Keep case-insensitive behavior while avoiding extra allocations when possible.
-        let lower = col.to_lowercase();
-        hasher.update(lower.as_bytes());
-        hasher.update(b"=");
-        let val = get_column_value_ci(row, col);
-        let norm = normalize_null(&val);
-        hasher.update(norm.as_bytes());
-        hasher.update(b";");
-    }
-    hasher.finalize().as_bytes().to_vec()
-}
-
-// Compute row hash directly from values + columns.
-fn row_hash_values(values: &[String], columns: &[String]) -> Vec<u8> {
-    let mut hasher = blake3::Hasher::new();
-    for (i, col) in columns.iter().enumerate() {
-        let lower = col.to_lowercase();
-        hasher.update(lower.as_bytes());
-        hasher.update(b"=");
-        let val = values.get(i).cloned().unwrap_or_default();
-        let norm = normalize_null(&val);
-        hasher.update(norm.as_bytes());
-        hasher.update(b";");
-    }
-    hasher.finalize().as_bytes().to_vec()
 }
 
 // Hash PK values into a deterministic key.
-fn hash_pk(row: &InsertRow, pk_cols: &[String]) -> String {
-    let mut hasher = blake3::Hasher::new();
-    for (idx, col) in pk_cols.iter().enumerate() {
-        if idx > 0 {
-            hasher.update(b"|");
-        }
-        let val = get_column_value_ci(row, col);
-        let norm = normalize_null(&val);
-        hasher.update(norm.as_bytes());
-    }
-    hex::encode(hasher.finalize().as_bytes())
-}
 
 // Binary table file writer (header + rows).
 struct TableBinWriter {
@@ -1084,9 +952,10 @@ fn write_table_header(w: &mut BufWriter<File>, columns: &[String]) -> std::io::R
 }
 
 // Read header and return columns + reader.
-fn open_table_bin(path: &str) -> std::io::Result<(Vec<String>, BufReader<File>)> {
+fn open_table_bin(path: &str, reader_kb: usize) -> std::io::Result<(Vec<String>, BufReader<File>)> {
     let file = File::open(path)?;
-    let mut reader = BufReader::new(file);
+    let cap = std::cmp::max(1024 * 1024, reader_kb * 1024);
+    let mut reader = BufReader::with_capacity(cap, file);
     let mut magic = [0u8; 4];
     reader.read_exact(&mut magic)?;
     if &magic != b"SQDR" {
