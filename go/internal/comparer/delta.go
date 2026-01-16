@@ -10,7 +10,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"syscall"
 	"sort"
 	"strings"
 	"sync"
@@ -562,7 +561,7 @@ func buildTableStoreFromReader(r *bufio.Reader, columns []string, pkCols []strin
 	if storeMmap {
 		info, err := storeFile.Stat()
 		if err == nil && info.Size() > 0 {
-			data, err := syscall.Mmap(int(storeFile.Fd()), 0, int(info.Size()), syscall.PROT_READ, syscall.MAP_SHARED)
+			data, err := mmapFile(storeFile, int(info.Size()))
 			if err == nil {
 				store.mmap = data
 			} else if logger.IsDebugEnabled() {
@@ -578,7 +577,7 @@ func (s *tableStore) close() {
 		return
 	}
 	if s.mmap != nil {
-		_ = syscall.Munmap(s.mmap)
+		_ = munmapFile(s.mmap)
 	}
 	_ = s.file.Close()
 	_ = os.Remove(s.path)
