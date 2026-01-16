@@ -1,14 +1,12 @@
 package com.sqldumpdiff;
 
 import java.io.BufferedReader;
-import java.io.BufferedWriter;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.OutputStreamWriter;
 import java.io.Writer;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.sql.SQLException;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -234,7 +232,7 @@ public class DeltaGenerator {
             ProgressBar progressBar) throws IOException {
 
         InsertParser parser = new InsertParser();
-        Map<String, BufferedWriter> writers = new HashMap<>();
+        Map<String, TableBinIO.TableBinWriter> writers = new HashMap<>();
         Map<String, Path> tablePaths = new HashMap<>();
         Map<String, Long> rowCounts = new HashMap<>();
         long bytesRead = 0;
@@ -262,17 +260,19 @@ public class DeltaGenerator {
                     }
 
                     if (!writers.containsKey(row.table())) {
-                        Path tablePath = tempDir.resolve(label + "_" + sanitizeFilename(row.table()) + ".jsonl");
+                        List<String> cols = columnsMap.getOrDefault(row.table(), row.columns());
+                        if (cols == null || cols.isEmpty()) {
+                            continue;
+                        }
+                        Path tablePath = tempDir.resolve(label + "_" + sanitizeFilename(row.table()) + ".bin");
                         tablePaths.put(row.table(), tablePath);
-                        writers.put(row.table(), Files.newBufferedWriter(tablePath));
+                        writers.put(row.table(), TableBinIO.openWriter(tablePath, cols));
                         rowCounts.put(row.table(), 0L);
                         log.log(java.util.logging.Level.FINE, "Processing {0} table: {1}",
                                 new Object[] { label, row.table() });
                     }
 
-                    String json = row.toJson();
-                    writers.get(row.table()).write(json);
-                    writers.get(row.table()).newLine();
+                    writers.get(row.table()).writeRow(row.data());
                     rowCounts.put(row.table(), rowCounts.get(row.table()) + 1);
                 }
             }
@@ -288,7 +288,7 @@ public class DeltaGenerator {
                 progressBar.stepTo(progressBar.getMax());
             }
         } finally {
-            for (BufferedWriter writer : writers.values()) {
+            for (TableBinIO.TableBinWriter writer : writers.values()) {
                 writer.close();
             }
         }
@@ -310,7 +310,7 @@ public class DeltaGenerator {
             }
 
             return result;
-        } catch (IOException | SQLException e) {
+        } catch (IOException e) {
             System.err.println("Error comparing table " + comparison.tableName() + ": " + e.getMessage());
             return new TableCompareResult(
                     new ComparisonResult(comparison.tableName(), "", "", 0, 0, 0),

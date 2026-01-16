@@ -1,10 +1,8 @@
 package com.sqldumpdiff;
 
-import java.io.BufferedReader;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -16,7 +14,7 @@ import lombok.extern.java.Log;
 
 /**
  * Compares old and new table data to generate delta SQL.
- * Uses SQLite for memory-efficient storage of old records instead of HashMap.
+ * Uses a binary on-disk store for memory-efficient storage of old records.
  */
 @Log
 public class TableComparer {
@@ -26,15 +24,15 @@ public class TableComparer {
         this.profile = profile;
     }
 
-    public TableCompareResult compare(TableComparison comparison) throws IOException, SQLException {
+    public TableCompareResult compare(TableComparison comparison) throws IOException {
         if (comparison.pkColumns() == null) {
             return new TableCompareResult(
                     new ComparisonResult(comparison.tableName(), "", "", 0, 0, 0),
                     new TableTiming(comparison.tableName(), 0, 0, 0));
         }
 
-        // Use SQLite instead of HashMap for memory efficiency
-        SQLiteTableStore oldStore = new SQLiteTableStore(comparison.tableName(), comparison.pkColumns(), profile);
+        // Use a binary store instead of SQLite for memory efficiency
+        BinaryTableStore oldStore = null;
 
         long loadMs = 0;
         long compareMs = 0;
@@ -44,11 +42,10 @@ public class TableComparer {
             // Load old records into SQLite
             if (comparison.oldFile() != null && Files.exists(comparison.oldFile())) {
                 long start = System.nanoTime();
-                loadTableFileToSQLite(comparison.oldFile(), comparison.tableName(), oldStore);
-                oldStore.analyzeForQuery(); // Optimize query plan after loading
+                oldStore = loadTableFileToStore(comparison.oldFile(), comparison.tableName(), comparison.pkColumns());
                 loadMs = (System.nanoTime() - start) / 1_000_000L;
 
-                long oldCount = oldStore.getRowCount();
+                long oldCount = oldStore != null ? oldStore.getRowCount() : 0;
                 if (oldCount == 0) {
                     log.fine(() -> "Table " + comparison.tableName() + ": No old rows loaded. PK columns: " +
                             String.join(", ", comparison.pkColumns()));
@@ -65,27 +62,24 @@ public class TableComparer {
             // Process new rows
             if (comparison.newFile() != null && Files.exists(comparison.newFile())) {
                 long start = System.nanoTime();
-                try (BufferedReader reader = Files.newBufferedReader(comparison.newFile())) {
+                try (TableBinIO.TableBinReader reader = TableBinIO.openReader(comparison.newFile())) {
                     long fileSize = Files.size(comparison.newFile());
                     int baseBatch = profile != null ? profile.batch() : 1000;
                     int batchSize = adjustBatchByFileSize(baseBatch, fileSize);
                     List<String> pkBatch = new ArrayList<>(batchSize);
                     List<InsertRow> rowBatch = new ArrayList<>(batchSize);
-                    String line;
-                    while ((line = reader.readLine()) != null) {
-                        if (line.trim().isEmpty()) {
-                            continue;
-                        }
-
-                        InsertRow newRow = InsertRow.fromJson(line, comparison.tableName());
+                    List<String> columns = reader.columns();
+                    List<String> values;
+                    while ((values = reader.readRow()) != null) {
+                        InsertRow newRow = buildRow(comparison.tableName(), columns, values);
                         List<String> pkValues = getPkValues(newRow, comparison.pkColumns());
-                        String pkHash = SQLiteTableStore.hashPrimaryKeyValues(pkValues);
+                        String pkHash = BinaryTableStore.hashPrimaryKeyValues(pkValues);
                         pkBatch.add(pkHash);
                         rowBatch.add(newRow);
 
                         if (pkBatch.size() >= batchSize) {
-                            int[] counts = updateCounts(comparison, oldStore, pkBatch, rowBatch, changes,
-                                    matchedOld);
+                        int[] counts = updateCounts(comparison, oldStore, pkBatch, rowBatch, changes,
+                                matchedOld);
                             insertCount += counts[0];
                             updateCount += counts[1];
                             pkBatch.clear();
@@ -103,20 +97,22 @@ public class TableComparer {
 
             // Handle deletions: emit any old row hashes that were never matched
             long deleteStart = System.nanoTime();
-            Set<String> allOldHashes = oldStore.getAllPkHashes();
-            for (String pkHash : allOldHashes) {
-                if (matchedOld.contains(pkHash)) {
-                    continue;
+            if (oldStore != null) {
+                Set<String> allOldHashes = oldStore.getAllPkHashes();
+                for (String pkHash : allOldHashes) {
+                    if (matchedOld.contains(pkHash)) {
+                        continue;
+                    }
+
+                    Map<String, String> oldData = oldStore.getRowData(pkHash);
+                    String whereClause = buildWhereClause(comparison.pkColumns(), oldData);
+
+                    deletions.append("-- DELETED FROM ").append(comparison.tableName());
+                    deletions.append(": ").append(pkHash).append("\n");
+                    deletions.append("DELETE FROM `").append(comparison.tableName()).append("`");
+                    deletions.append(" WHERE ").append(whereClause).append(";\n\n");
+                    deleteCount++;
                 }
-
-                Map<String, String> oldData = oldStore.getRowData(pkHash);
-                String whereClause = buildWhereClause(comparison.pkColumns(), oldData);
-
-                deletions.append("-- DELETED FROM ").append(comparison.tableName());
-                deletions.append(": ").append(pkHash).append("\n");
-                deletions.append("DELETE FROM `").append(comparison.tableName()).append("`");
-                deletions.append(" WHERE ").append(whereClause).append(";\n\n");
-                deleteCount++;
             }
             deleteMs = (System.nanoTime() - deleteStart) / 1_000_000L;
 
@@ -130,34 +126,32 @@ public class TableComparer {
             TableTiming timing = new TableTiming(comparison.tableName(), loadMs, compareMs, deleteMs);
             return new TableCompareResult(result, timing);
         } finally {
-            oldStore.close();
+            if (oldStore != null) {
+                oldStore.close();
+            }
         }
     }
 
-    private void loadTableFileToSQLite(Path file, String table, SQLiteTableStore store)
-
-            throws IOException, SQLException {
-        // Read rows and insert into SQLite
-        try (BufferedReader reader = Files.newBufferedReader(file)) {
-            String line;
+    private BinaryTableStore loadTableFileToStore(Path file, String table, List<String> pkColumns)
+            throws IOException {
+        BinaryTableStore store = null;
+        try (TableBinIO.TableBinReader reader = TableBinIO.openReader(file)) {
             int batch = 0;
-            while ((line = reader.readLine()) != null) {
-                if (line.trim().isEmpty()) {
-                    continue;
-                }
-
-                InsertRow row = InsertRow.fromJson(line, table);
+            List<String> columns = reader.columns();
+            store = new BinaryTableStore(table, columns, pkColumns);
+            List<String> values;
+            while ((values = reader.readRow()) != null) {
+                InsertRow row = buildRow(table, columns, values);
                 store.insertRow(row);
 
                 int batchSize = profile != null ? profile.batch() : 1000;
-                // Execute batch every N rows for better memory management
                 if (++batch % batchSize == 0) {
                     store.executeBatch();
                 }
             }
-            // Final batch
             store.executeBatch();
         }
+        return store;
     }
 
     private List<String> getPkValues(InsertRow row, List<String> pkColumns) {
@@ -168,18 +162,21 @@ public class TableComparer {
         return result;
     }
 
-    private int[] updateCounts(TableComparison comparison, SQLiteTableStore oldStore, List<String> pkBatch,
-            List<InsertRow> rowBatch, StringBuilder changes, Set<String> matchedOld) throws SQLException {
+    private int[] updateCounts(TableComparison comparison, BinaryTableStore oldStore, List<String> pkBatch,
+            List<InsertRow> rowBatch, StringBuilder changes, Set<String> matchedOld) throws IOException {
         int insertCount = 0;
         int updateCount = 0;
-        Map<String, Map<String, String>> oldDataBatch = oldStore.getRowDataBatch(pkBatch);
+        Map<String, Map<String, String>> oldDataBatch = oldStore == null
+                ? java.util.Collections.emptyMap()
+                : oldStore.getRowDataBatch(pkBatch);
         for (int i = 0; i < rowBatch.size(); i++) {
             InsertRow newRow = rowBatch.get(i);
             String pkHash = pkBatch.get(i);
             Map<String, String> oldData = oldDataBatch.get(pkHash);
             if (oldData == null) {
                 changes.append("-- NEW RECORD IN ").append(comparison.tableName()).append("\n");
-                changes.append(newRow.statement()).append("\n\n");
+                changes.append(buildInsertStatement(comparison.tableName(), newRow.columns(), newRow.data()))
+                        .append("\n\n");
                 insertCount++;
                 continue;
             }
@@ -268,5 +265,34 @@ public class TableComparer {
         }
 
         return String.join(" AND ", parts);
+    }
+
+    private InsertRow buildRow(String table, List<String> columns, List<String> values) {
+        Map<String, String> data = new java.util.HashMap<>();
+        for (int i = 0; i < columns.size(); i++) {
+            data.put(columns.get(i), values.get(i));
+        }
+        return new InsertRow(table, columns, data, "");
+    }
+
+    private String buildInsertStatement(String table, List<String> columns, Map<String, String> data) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("INSERT INTO `").append(table).append("` (");
+        for (int i = 0; i < columns.size(); i++) {
+            if (i > 0) sb.append(", ");
+            sb.append('`').append(columns.get(i)).append('`');
+        }
+        sb.append(") VALUES (");
+        for (int i = 0; i < columns.size(); i++) {
+            if (i > 0) sb.append(", ");
+            String val = data.get(columns.get(i));
+            if (val == null || "NULL".equalsIgnoreCase(val)) {
+                sb.append("NULL");
+            } else {
+                sb.append(val);
+            }
+        }
+        sb.append(");");
+        return sb.toString();
     }
 }

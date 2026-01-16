@@ -5,6 +5,7 @@ import csv
 import os
 import json
 import tempfile
+import struct
 import subprocess
 import shutil
 import concurrent.futures
@@ -481,18 +482,100 @@ def expand_insert_statement(insert_statement, columns_map_for_file):
     return results
 
 
-def _load_table_file(path):
-    """Loads JSONL rows for a single table. Each line structure: {columns, data, stmt}."""
-    entries = []
+_TABLE_MAGIC = b"SQDR"
+_TABLE_VERSION = 1
+
+
+def _write_u32(f, value: int):
+    f.write(struct.pack("<I", value))
+
+
+def _read_u32(f):
+    data = f.read(4)
+    if len(data) < 4:
+        return None
+    return struct.unpack("<I", data)[0]
+
+
+def _write_bytes(f, b: bytes):
+    _write_u32(f, len(b))
+    if b:
+        f.write(b)
+
+
+def _read_bytes(f):
+    n = _read_u32(f)
+    if n is None:
+        return None
+    if n == 0:
+        return b""
+    data = f.read(n)
+    if len(data) < n:
+        return None
+    return data
+
+
+def _write_table_header(f, columns):
+    f.write(_TABLE_MAGIC)
+    _write_u32(f, _TABLE_VERSION)
+    _write_u32(f, len(columns))
+    for col in columns:
+        _write_bytes(f, col.encode("utf-8"))
+
+
+def _read_table_header(f):
+    magic = f.read(4)
+    if len(magic) < 4 or magic != _TABLE_MAGIC:
+        raise ValueError("invalid table file magic")
+    version = _read_u32(f)
+    if version != _TABLE_VERSION:
+        raise ValueError(f"unsupported table file version: {version}")
+    col_count = _read_u32(f)
+    columns = []
+    for _ in range(col_count):
+        b = _read_bytes(f)
+        if b is None:
+            raise EOFError("unexpected EOF while reading columns")
+        columns.append(b.decode("utf-8"))
+    return columns
+
+
+def _write_row_values(f, columns, data):
+    _write_u32(f, len(columns))
+    for col in columns:
+        val = data.get(col)
+        if val is None:
+            _write_bytes(f, b"")
+        else:
+            _write_bytes(f, str(val).encode("utf-8"))
+
+
+def _read_row_values(f, columns):
+    count = _read_u32(f)
+    if count is None:
+        return None
+    if count != len(columns):
+        raise ValueError("row column count mismatch")
+    values = []
+    for _ in range(count):
+        b = _read_bytes(f)
+        if b is None:
+            return None
+        values.append(b.decode("utf-8") if b else None)
+    return values
+
+
+def _iter_table_rows(path):
     if not path or not os.path.exists(path):
-        return entries
-    with open(path, 'r', encoding='utf-8') as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            entries.append(json.loads(line))
-    return entries
+        return
+    with open(path, "rb") as f:
+        columns = _read_table_header(f)
+        while True:
+            values = _read_row_values(f, columns)
+            if values is None:
+                break
+            data = {c: v for c, v in zip(columns, values)}
+            yield columns, data
 
 
 def _process_table(args):
@@ -502,10 +585,12 @@ def _process_table(args):
 
     old_records = {}
     # Load old rows
-    for entry in _load_table_file(old_path):
-        data = entry.get('data', {})
+    old_columns = None
+    for columns, data in _iter_table_rows(old_path) or []:
+        if old_columns is None:
+            old_columns = columns
         pk_values = tuple(data.get(c) for c in pk_cols)
-        old_records[pk_values] = entry
+        old_records[pk_values] = data
     load_ms = int((time.monotonic() - t_load_start) * 1000)
 
     changes_lines = []
@@ -517,10 +602,13 @@ def _process_table(args):
 
     # Process new rows
     t_compare_start = time.monotonic()
-    for entry in _load_table_file(new_path):
-        data = entry.get('data', {})
-        cols = entry.get('columns', [])
-        stmt = entry.get('stmt', '')
+    new_columns = None
+    for cols, data in _iter_table_rows(new_path) or []:
+        if new_columns is None:
+            new_columns = cols
+        if old_columns is None:
+            old_columns = cols
+        stmt = build_insert_statement(table, cols, data)
         pk_values = tuple(data.get(c) for c in pk_cols)
         old_entry = old_records.get(pk_values)
 
@@ -532,7 +620,7 @@ def _process_table(args):
         matched_old.add(pk_values)
         updates = []
         comments = []
-        old_data = old_entry.get('data', {})
+        old_data = old_entry
         for col in cols:
             ov, nv = old_data.get(col), data.get(col)
             ov_norm, nv_norm = normalize_null(ov), normalize_null(nv)
@@ -558,7 +646,7 @@ def _process_table(args):
     for pk_values, old_entry in old_records.items():
         if pk_values in matched_old:
             continue
-        old_data = old_entry.get('data', {})
+        old_data = old_entry
         where_str = build_where_clause(pk_cols, old_data)
         deletion_lines.append(f"-- DELETED FROM {table}: {pk_values}\n")
         deletion_lines.append(f"DELETE FROM `{table}` WHERE {where_str};\n\n")
@@ -596,11 +684,12 @@ def _process_insert_for_split(args):
 
 
 def split_dump_by_table(dump_file, columns_map, pk_map, tmpdir, label, show_progress=False, profile=None):
-    """Split a dump into per-table JSONL files for parallel processing.
-    Returns a dict: table_name -> jsonl path.
+    """Split a dump into per-table binary files for parallel processing.
+    Returns a dict: table_name -> bin path.
     """
     table_files = {}
     file_handles = {}
+    file_columns = {}
     
     # Check if parallel INSERT processing is enabled
     parallel_inserts_env = os.getenv("SQLDUMPDIFF_PARALLEL_INSERTS", "0")
@@ -654,16 +743,15 @@ def split_dump_by_table(dump_file, columns_map, pk_map, tmpdir, label, show_prog
                         continue
 
                     if table not in table_files:
-                        path = os.path.join(tmpdir, f"{label}_{_sanitize_filename(table)}.jsonl")
+                        path = os.path.join(tmpdir, f"{label}_{_sanitize_filename(table)}.bin")
                         table_files[table] = path
-                        file_handles[table] = open(path, 'w', encoding='utf-8')
+                        f = open(path, "wb")
+                        file_handles[table] = f
+                        file_columns[table] = cols
+                        _write_table_header(f, cols)
 
-                    line = json.dumps({
-                        'columns': cols,
-                        'data': data,
-                        'stmt': single_stmt,
-                    }, ensure_ascii=False)
-                    file_handles[table].write(line + "\n")
+                    f = file_handles[table]
+                    _write_row_values(f, file_columns[table], data)
     else:
         # Serial mode (default): stream and process one at a time
         with open(dump_file, 'r', encoding='utf-8') as f:
@@ -681,16 +769,15 @@ def split_dump_by_table(dump_file, columns_map, pk_map, tmpdir, label, show_prog
                         continue
 
                     if table not in table_files:
-                        path = os.path.join(tmpdir, f"{label}_{_sanitize_filename(table)}.jsonl")
+                        path = os.path.join(tmpdir, f"{label}_{_sanitize_filename(table)}.bin")
                         table_files[table] = path
-                        file_handles[table] = open(path, 'w', encoding='utf-8')
+                        f = open(path, "wb")
+                        file_handles[table] = f
+                        file_columns[table] = cols
+                        _write_table_header(f, cols)
 
-                    line = json.dumps({
-                        'columns': cols,
-                        'data': data,
-                        'stmt': single_stmt,
-                    }, ensure_ascii=False)
-                    file_handles[table].write(line + "\n")
+                    f = file_handles[table]
+                    _write_row_values(f, file_columns[table], data)
 
     # Close handles
     for h in file_handles.values():
@@ -718,14 +805,28 @@ def build_where_clause(pk_cols, data):
             where_parts.append(f"`{c}`='{safe_val}'")
     return " AND ".join(where_parts)
 
-def load_sqlite_profiles(path):
+
+def build_insert_statement(table, columns, data):
+    """Builds an INSERT statement with explicit columns."""
+    cols_sql = ", ".join(f"`{c}`" for c in columns)
+    vals = []
+    for c in columns:
+        val = data.get(c)
+        if val is None or (isinstance(val, str) and val.upper() == "NULL"):
+            vals.append("NULL")
+        else:
+            vals.append(str(val))
+    return f"INSERT INTO `{table}` ({cols_sql}) VALUES ({', '.join(vals)});"
+
+def load_store_profiles(path):
     with open(path, 'r', encoding='utf-8') as f:
         data = yaml.safe_load(f) or {}
     return data.get('profiles', {})
 
 
 def generate_delta(old_file, new_file, delta_out=None, debug=False, timing=False, timing_json=None,
-                   sqlite_profile="fast", sqlite_profile_file="sqlite_profiles.yaml"):
+                   store_profile="fast", store_profile_file="store_profiles.yaml",
+                   sqlite_profile=None, sqlite_profile_file=None):
     """Generates a delta SQL script comparing two SQL dump files.
     
     Args:
@@ -755,14 +856,20 @@ def generate_delta(old_file, new_file, delta_out=None, debug=False, timing=False
     progress_stream = sys.stderr
     
     wall_start = _WALL_START
-    profiles = load_sqlite_profiles(sqlite_profile_file)
-    profile = profiles.get(sqlite_profile)
+    profile_name = store_profile
+    profile_path = store_profile_file
+    if sqlite_profile:
+        profile_name = sqlite_profile
+    if sqlite_profile_file:
+        profile_path = sqlite_profile_file
+    profiles = load_store_profiles(profile_path)
+    profile = profiles.get(profile_name)
     if profile is None:
-        raise ValueError(f"Invalid --sqlite-profile '{sqlite_profile}'")
+        raise ValueError(f"Invalid --store-profile '{profile_name}'")
     if debug or timing:
         # Python implementation does not use SQLite, so cache/mmap are informational only.
         print(
-            f"[DEBUG] Using profile '{sqlite_profile}': "
+            f"[DEBUG] Using profile '{profile_name}': "
             f"cache_kb={profile.get('cache_kb')}, mmap_mb={profile.get('mmap_mb')}, "
             f"batch={profile.get('batch')}, workers={profile.get('workers')}",
             file=sys.stderr,
@@ -1029,8 +1136,10 @@ if __name__ == "__main__":
     parser.add_argument("new_dump", help="New SQL dump file")
     parser.add_argument("output", nargs="?", default=None, help="Output delta SQL (optional)")
     parser.add_argument("--timing-json", dest="timing_json", default=None, help="Write timing report JSON to file")
-    parser.add_argument("--sqlite-profile", dest="sqlite_profile", default="fast", help="SQLite profile name (low-mem, balanced, fast)")
-    parser.add_argument("--sqlite-profile-file", dest="sqlite_profile_file", default="sqlite_profiles.yaml", help="SQLite profiles YAML file")
+    parser.add_argument("--store-profile", dest="store_profile", default="fast", help="Store profile name (low-mem, balanced, fast)")
+    parser.add_argument("--store-profile-file", dest="store_profile_file", default="store_profiles.yaml", help="Store profiles YAML file")
+    parser.add_argument("--sqlite-profile", dest="sqlite_profile", default=None, help="Deprecated: use --store-profile")
+    parser.add_argument("--sqlite-profile-file", dest="sqlite_profile_file", default=None, help="Deprecated: use --store-profile-file")
     if len(sys.argv) == 1:
         parser.print_help()
         sys.exit(1)
@@ -1043,6 +1152,8 @@ if __name__ == "__main__":
         debug=args.debug,
         timing=args.timing,
         timing_json=args.timing_json,
+        store_profile=args.store_profile,
+        store_profile_file=args.store_profile_file,
         sqlite_profile=args.sqlite_profile,
         sqlite_profile_file=args.sqlite_profile_file,
     )

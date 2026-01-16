@@ -62,12 +62,12 @@ public class SqlDumpDiff {
 
     static void main(String[] args) {
         Instant wallStart = Instant.now();
-        // Parse flags first (supports --debug, --timing, --timing-json, --sqlite-profile, --sqlite-profile-file).
+        // Parse flags first (supports --debug, --timing, --timing-json, --store-profile, --store-profile-file).
         boolean debug = false;
         boolean timing = false;
         String timingJson = null;
         String sqliteProfile = "fast";
-        String sqliteProfileFile = "sqlite_profiles.yaml";
+        String sqliteProfileFile = "store_profiles.yaml";
         java.util.List<String> positional = new java.util.ArrayList<>();
 
         for (int i = 0; i < args.length; i++) {
@@ -88,7 +88,7 @@ public class SqlDumpDiff {
                 }
                 continue;
             }
-            if (arg.startsWith("--sqlite-profile")) {
+            if (arg.startsWith("--store-profile") || arg.startsWith("--sqlite-profile")) {
                 if (arg.contains("=")) {
                     sqliteProfile = arg.substring(arg.indexOf('=') + 1);
                 } else if (i + 1 < args.length) {
@@ -96,7 +96,7 @@ public class SqlDumpDiff {
                 }
                 continue;
             }
-            if (arg.startsWith("--sqlite-profile-file")) {
+            if (arg.startsWith("--store-profile-file") || arg.startsWith("--sqlite-profile-file")) {
                 if (arg.contains("=")) {
                     sqliteProfileFile = arg.substring(arg.indexOf('=') + 1);
                 } else if (i + 1 < args.length) {
@@ -117,8 +117,10 @@ public class SqlDumpDiff {
             System.err.println("  --debug        Enable detailed console logging and disable progress bars");
             System.err.println("  --timing       Emit timing diagnostics even without --debug");
             System.err.println("  --timing-json  Write timing report JSON to the given file");
-            System.err.println("  --sqlite-profile       SQLite profile name (low-mem, balanced, fast)");
-            System.err.println("  --sqlite-profile-file  SQLite profiles YAML file");
+            System.err.println("  --store-profile       Store profile name (low-mem, balanced, fast)");
+            System.err.println("  --store-profile-file  Store profiles YAML file");
+            System.err.println("  --sqlite-profile      Deprecated: use --store-profile");
+            System.err.println("  --sqlite-profile-file Deprecated: use --store-profile-file");
             System.err.println();
             System.err.println("Notes:");
             System.err.println("  If output.sql is not provided, delta SQL is printed to stdout");
