@@ -202,6 +202,9 @@ func main() {
 	if *timing || logger.IsDebugEnabled() {
 		logger.Debug("Timing: schema/columns parsing took %s", time.Since(startSchema))
 	}
+	if *timing && !logger.IsDebugEnabled() {
+		fmt.Fprintf(os.Stderr, "Timing: schema/columns parsing took %s\n", time.Since(startSchema))
+	}
 
 	// Merge PK maps (prefer new file PKs if both have a PK definition).
 	for table, pk := range newPKMap {
@@ -241,6 +244,34 @@ func main() {
 
 	if *timing || logger.IsDebugEnabled() {
 		logger.Debug("Timing: total wall time %s", time.Since(startWall))
+	}
+	if *timing && !logger.IsDebugEnabled() && timingMeta != nil {
+		fmt.Fprintln(os.Stderr, "\nTiming summary")
+		fmt.Fprintln(os.Stderr, "----------------")
+		fmt.Fprintf(os.Stderr, "Split:          %s\n", time.Duration(timingMeta.SplitMS)*time.Millisecond)
+		fmt.Fprintf(os.Stderr, "Compare:        %s\n", time.Duration(timingMeta.CompareMS)*time.Millisecond)
+		fmt.Fprintf(os.Stderr, "Delete:         %s\n", time.Duration(timingMeta.DeleteMS)*time.Millisecond)
+		fmt.Fprintf(os.Stderr, "Write:          %s (format %s, io %s)\n",
+			time.Duration(timingMeta.WriteMS)*time.Millisecond,
+			time.Duration(timingMeta.WriteFormatMS)*time.Millisecond,
+			time.Duration(timingMeta.WriteIOMS)*time.Millisecond)
+		fmt.Fprintf(os.Stderr, "Wall time:      %s\n", time.Since(startWall))
+		if len(timingMeta.Tables) > 0 {
+			limit := 10
+			if len(timingMeta.Tables) < limit {
+				limit = len(timingMeta.Tables)
+			}
+			fmt.Fprintf(os.Stderr, "\nTop %d tables (by total)\n", limit)
+			for i := 0; i < limit; i++ {
+				t := timingMeta.Tables[i]
+				fmt.Fprintf(os.Stderr, "  %-32s %8s (load %6s, compare %6s, delete %6s)\n",
+					t.Table,
+					time.Duration(t.TotalMS())*time.Millisecond,
+					time.Duration(t.LoadMS)*time.Millisecond,
+					time.Duration(t.CompMS)*time.Millisecond,
+					time.Duration(t.DelMS)*time.Millisecond)
+			}
+		}
 	}
 
 	if *timingJSON != "" && timingMeta != nil {

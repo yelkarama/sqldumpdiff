@@ -37,8 +37,24 @@ pub struct TableTiming {
 }
 
 impl TableTiming {
-    fn total_ms(&self) -> u128 {
+    pub fn total_ms(&self) -> u128 {
         self.load_ms + self.compare_ms + self.delete_ms
+    }
+
+    pub fn table(&self) -> &str {
+        &self.table
+    }
+
+    pub fn load_ms(&self) -> u128 {
+        self.load_ms
+    }
+
+    pub fn compare_ms(&self) -> u128 {
+        self.compare_ms
+    }
+
+    pub fn delete_ms(&self) -> u128 {
+        self.delete_ms
     }
 }
 

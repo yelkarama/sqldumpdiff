@@ -211,6 +211,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             wall_start.elapsed()
         ));
     }
+    let timing_print = args.timing && !logger::is_debug();
 
     if let Some(path) = args.timing_json.as_ref() {
         let report = serde_json::json!({
@@ -249,8 +250,60 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         writeln!(stderr, "{}", sep)?;
     }
 
+    if timing_print {
+        eprintln!("\nTiming summary");
+        eprintln!("----------------");
+        eprintln!(
+            "Split:          {}",
+            format_duration_ms(timing_report.split_ms)
+        );
+        eprintln!(
+            "Compare:        {}",
+            format_duration_ms(timing_report.compare_ms)
+        );
+        eprintln!(
+            "Delete:         {}",
+            format_duration_ms(timing_report.delete_ms)
+        );
+        eprintln!(
+            "Write:          {} (format {}, io {})",
+            format_duration_ms(timing_report.write_ms),
+            format_duration_ms(timing_report.write_format_ms),
+            format_duration_ms(timing_report.write_io_ms)
+        );
+        eprintln!(
+            "Wall time:      {}",
+            format_duration_ms(wall_start.elapsed().as_millis())
+        );
+        if !timing_report.tables.is_empty() {
+            let limit = std::cmp::min(10, timing_report.tables.len());
+            eprintln!("\nTop {} tables (by total)", limit);
+            for t in timing_report.tables.iter().take(limit) {
+                eprintln!(
+                    "  {:<32} {:>8} (load {:>6}, compare {:>6}, delete {:>6})",
+                    t.table(),
+                    format_duration_ms(t.total_ms()),
+                    format_duration_ms(t.load_ms()),
+                    format_duration_ms(t.compare_ms()),
+                    format_duration_ms(t.delete_ms())
+                );
+            }
+        }
+    }
+
     logger::debug("main: Delta generation complete");
     Ok(())
+}
+
+fn format_duration_ms(ms: u128) -> String {
+    let d = std::time::Duration::from_millis(ms as u64);
+    let secs = d.as_secs();
+    let millis = d.subsec_millis();
+    if secs >= 60 {
+        format!("{}m{:02}.{:03}s", secs / 60, secs % 60, millis)
+    } else {
+        format!("{}.{:03}s", secs, millis)
+    }
 }
 
 fn basename(path: &str) -> String {
