@@ -13,6 +13,8 @@ require (
 	github.com/acarl005/stripansi v0.0.0-20180116102854-5a71ef0e047d // indirect
 	github.com/clipperhouse/stringish v0.1.1 // indirect
 	github.com/clipperhouse/uax29/v2 v2.3.0 // indirect
+	github.com/klauspost/cpuid/v2 v2.0.12 // indirect
 	github.com/mattn/go-runewidth v0.0.19 // indirect
+	github.com/zeebo/blake3 v0.2.4 // indirect
 	golang.org/x/sys v0.39.0 // indirect
 )

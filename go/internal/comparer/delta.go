@@ -3,10 +3,9 @@ package comparer
 import (
 	"bufio"
 	"bytes"
-	"crypto/sha256"
 	"database/sql"
+	"encoding/binary"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -19,6 +18,7 @@ import (
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/zeebo/blake3"
 
 	"github.com/vbauerster/mpb/v8"
 	"github.com/vbauerster/mpb/v8/decor"
@@ -85,15 +85,15 @@ func rowHash(row *parser.InsertRow) []byte {
 		b.WriteString(normalizeNull(val))
 		b.WriteString(";")
 	}
-	sum := sha256.Sum256([]byte(b.String()))
+	sum := blake3.Sum256([]byte(b.String()))
 	return sum[:]
 }
 
-// splitDumpByTable streams INSERT rows and writes per-table JSONL files.
-// This mirrors the Java pipeline and keeps later comparisons table-local.
+// splitDumpByTable streams INSERT rows and writes per-table binary files.
+// This mirrors the Rust pipeline and keeps later comparisons table-local.
 func splitDumpByTable(dumpFile string, columnsMap map[string][]string, pkMap map[string][]string, tempDir string, label string, p *mpb.Progress, progressLabel string) (map[string]string, error) {
 	insertParser := parser.NewInsertParser()
-	writers := make(map[string]*bufio.Writer)
+	writers := make(map[string]*tableBinWriter)
 	files := make(map[string]*os.File)
 	tablePaths := make(map[string]string)
 	missingTables := make(map[string]bool)
@@ -109,26 +109,34 @@ func splitDumpByTable(dumpFile string, columnsMap map[string][]string, pkMap map
 		bw, ok := writers[resolved]
 		if !ok {
 			name := sanitizeFilename(resolved)
-			path := filepath.Join(tempDir, fmt.Sprintf("%s_%s.jsonl", label, name))
+			path := filepath.Join(tempDir, fmt.Sprintf("%s_%s.bin", label, name))
 			f, e := os.Create(path)
 			if e != nil {
 				return
 			}
 			files[resolved] = f
-			bw = bufio.NewWriter(f)
+			writer := bufio.NewWriter(f)
+			if err := writeTableHeader(writer, row.Columns); err != nil {
+				return
+			}
+			bw = &tableBinWriter{columns: row.Columns, w: writer}
 			writers[resolved] = bw
 			tablePaths[resolved] = path
 		}
-		jsonStr, e := row.ToJSON()
-		if e != nil {
+		if len(row.Columns) != len(bw.columns) {
 			return
 		}
-		bw.WriteString(jsonStr)
-		bw.WriteByte('\n')
+		values := make([]string, 0, len(bw.columns))
+		for _, col := range bw.columns {
+			values = append(values, row.Data[col])
+		}
+		if err := writeRowValues(bw.w, values); err != nil {
+			return
+		}
 	})
 
 	for _, bw := range writers {
-		bw.Flush()
+		bw.w.Flush()
 	}
 	for _, f := range files {
 		f.Close()
@@ -163,7 +171,7 @@ func sanitizeFilename(name string) string {
 	if b.Len() == 0 {
 		b.WriteString("table")
 	}
-	sum := sha256.Sum256([]byte(name))
+	sum := blake3.Sum256([]byte(name))
 	return fmt.Sprintf("%s_%s", b.String(), hex.EncodeToString(sum[:4]))
 }
 
@@ -182,36 +190,270 @@ func resolveTableName(pkMap map[string][]string, name string) (string, bool) {
 	return "", false
 }
 
-// loadTableJSONL reads a JSONL file (one row per line) and stores it in SQLite.
-func loadTableJSONL(db *sql.DB, path string, pkCols []string) error {
-	f, err := os.Open(path)
-	if err != nil {
+type tableBinWriter struct {
+	columns []string
+	w       *bufio.Writer
+}
+
+func writeTableHeader(w *bufio.Writer, columns []string) error {
+	if _, err := w.Write([]byte("SQDR")); err != nil {
 		return err
 	}
-	defer f.Close()
+	if err := writeU32(w, 1); err != nil {
+		return err
+	}
+	if err := writeU32(w, uint32(len(columns))); err != nil {
+		return err
+	}
+	for _, col := range columns {
+		if err := writeBytes(w, []byte(col)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
+func openTableBin(path string) ([]string, *os.File, *bufio.Reader, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	r := bufio.NewReader(f)
+	magic := make([]byte, 4)
+	if _, err := io.ReadFull(r, magic); err != nil {
+		f.Close()
+		return nil, nil, nil, err
+	}
+	if string(magic) != "SQDR" {
+		f.Close()
+		return nil, nil, nil, fmt.Errorf("invalid table file magic")
+	}
+	ver, err := readU32Required(r)
+	if err != nil {
+		f.Close()
+		return nil, nil, nil, err
+	}
+	if ver != 1 {
+		f.Close()
+		return nil, nil, nil, fmt.Errorf("unsupported table file version")
+	}
+	colCount, err := readU32Required(r)
+	if err != nil {
+		f.Close()
+		return nil, nil, nil, err
+	}
+	cols := make([]string, 0, colCount)
+	for i := 0; i < int(colCount); i++ {
+		b, err := readBytes(r)
+		if err != nil {
+			f.Close()
+			return nil, nil, nil, err
+		}
+		cols = append(cols, string(b))
+	}
+	return cols, f, r, nil
+}
+
+func writeRowValues(w *bufio.Writer, values []string) error {
+	if err := writeU32(w, uint32(len(values))); err != nil {
+		return err
+	}
+	for _, v := range values {
+		if err := writeBytes(w, []byte(v)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func readRowValues(r *bufio.Reader) ([]string, error) {
+	count, err := readU32(r)
+	if err == io.EOF {
+		return nil, io.EOF
+	}
+	if err != nil {
+		return nil, err
+	}
+	values := make([]string, 0, count)
+	for i := 0; i < int(count); i++ {
+		b, err := readBytes(r)
+		if err != nil {
+			return nil, err
+		}
+		values = append(values, string(b))
+	}
+	return values, nil
+}
+
+func writeU32(w io.Writer, v uint32) error {
+	var buf [4]byte
+	binary.LittleEndian.PutUint32(buf[:], v)
+	_, err := w.Write(buf[:])
+	return err
+}
+
+func readU32(r io.Reader) (uint32, error) {
+	var buf [4]byte
+	_, err := io.ReadFull(r, buf[:])
+	if err != nil {
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			return 0, io.EOF
+		}
+		return 0, err
+	}
+	return binary.LittleEndian.Uint32(buf[:]), nil
+}
+
+func readU32Required(r io.Reader) (uint32, error) {
+	var buf [4]byte
+	if _, err := io.ReadFull(r, buf[:]); err != nil {
+		return 0, err
+	}
+	return binary.LittleEndian.Uint32(buf[:]), nil
+}
+
+func writeBytes(w io.Writer, b []byte) error {
+	if err := writeU32(w, uint32(len(b))); err != nil {
+		return err
+	}
+	_, err := w.Write(b)
+	return err
+}
+
+func readBytes(r io.Reader) ([]byte, error) {
+	n, err := readU32Required(r)
+	if err != nil {
+		return nil, err
+	}
+	buf := make([]byte, n)
+	if _, err := io.ReadFull(r, buf); err != nil {
+		return nil, err
+	}
+	return buf, nil
+}
+
+func encodeRowValues(values []string) []byte {
+	var buf bytes.Buffer
+	_ = writeU32(&buf, uint32(len(values)))
+	for _, v := range values {
+		_ = writeBytes(&buf, []byte(v))
+	}
+	return buf.Bytes()
+}
+
+func decodeRowValues(blob []byte) ([]string, error) {
+	r := bytes.NewReader(blob)
+	count, err := readU32Required(r)
+	if err != nil {
+		return nil, err
+	}
+	values := make([]string, 0, count)
+	for i := 0; i < int(count); i++ {
+		b, err := readBytes(r)
+		if err != nil {
+			return nil, err
+		}
+		values = append(values, string(b))
+	}
+	return values, nil
+}
+
+func buildRowFromValues(table string, columns []string, values []string) *parser.InsertRow {
+	data := make(map[string]string, len(columns))
+	for i, col := range columns {
+		if i < len(values) {
+			data[col] = values[i]
+		} else {
+			data[col] = ""
+		}
+	}
+	return &parser.InsertRow{
+		Table:   table,
+		Columns: columns,
+		Data:   data,
+	}
+}
+
+func buildInsertFromValues(table string, columns []string, values []string) string {
+	cols := make([]string, 0, len(columns))
+	vals := make([]string, 0, len(columns))
+	for i, col := range columns {
+		cols = append(cols, fmt.Sprintf("`%s`", col))
+		v := ""
+		if i < len(values) {
+			v = values[i]
+		}
+		vals = append(vals, formatSQLValue(v))
+	}
+	return fmt.Sprintf("INSERT INTO `%s` (%s) VALUES (%s);", table, strings.Join(cols, ", "), strings.Join(vals, ", "))
+}
+
+func rowHashValues(values []string, columns []string) []byte {
+	var b strings.Builder
+	for i, col := range columns {
+		b.WriteString(strings.ToLower(col))
+		b.WriteString("=")
+		val := ""
+		if i < len(values) {
+			val = values[i]
+		}
+		b.WriteString(normalizeNull(val))
+		b.WriteString(";")
+	}
+	sum := blake3.Sum256([]byte(b.String()))
+	return sum[:]
+}
+
+func buildPKIndex(columns []string, pkCols []string) []int {
+	idx := make([]int, 0, len(pkCols))
+	for _, pk := range pkCols {
+		for i, col := range columns {
+			if col == pk {
+				idx = append(idx, i)
+				break
+			}
+		}
+	}
+	return idx
+}
+
+func hashPKValues(values []string, pkIndex []int) string {
+	parts := make([]string, 0, len(pkIndex))
+	for _, idx := range pkIndex {
+		val := ""
+		if idx >= 0 && idx < len(values) {
+			val = values[idx]
+		}
+		parts = append(parts, normalizeNull(val))
+	}
+	data := strings.Join(parts, "|")
+	hash := blake3.Sum256([]byte(data))
+	return hex.EncodeToString(hash[:])
+}
+
+// loadTableBin reads a binary table file and stores it in SQLite.
+func loadTableBin(db *sql.DB, r *bufio.Reader, columns []string, pkCols []string) error {
+	pkIndex := buildPKIndex(columns, pkCols)
 	tx, stmt, err := beginSQLiteInsert(db)
 	if err != nil {
 		return fmt.Errorf("begin insert: %w", err)
 	}
 	defer stmt.Close()
 
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
 	batchCount := 0
-	for scanner.Scan() {
-		line := scanner.Text()
-		if strings.TrimSpace(line) == "" {
-			continue
+	for {
+		values, err := readRowValues(r)
+		if err == io.EOF {
+			break
 		}
-		row, err := parser.FromJSON(line)
 		if err != nil {
 			_ = tx.Rollback()
-			return fmt.Errorf("parse json: %w", err)
+			return fmt.Errorf("read row: %w", err)
 		}
-		hash := hashPK(row, pkCols)
-		rh := rowHash(row)
-		if _, e := stmt.Exec(hash, rh, line); e != nil {
+		hash := hashPKValues(values, pkIndex)
+		rh := rowHashValues(values, columns)
+		blob := encodeRowValues(values)
+		if _, e := stmt.Exec(hash, rh, blob); e != nil {
 			_ = tx.Rollback()
 			return fmt.Errorf("insert row: %w", e)
 		}
@@ -231,10 +473,6 @@ func loadTableJSONL(db *sql.DB, path string, pkCols []string) error {
 			batchCount = 0
 		}
 	}
-	if err := scanner.Err(); err != nil {
-		_ = tx.Rollback()
-		return fmt.Errorf("scan jsonl: %w", err)
-	}
 	if err := stmt.Close(); err != nil {
 		_ = tx.Rollback()
 		return fmt.Errorf("close stmt: %w", err)
@@ -245,95 +483,178 @@ func loadTableJSONL(db *sql.DB, path string, pkCols []string) error {
 	return nil
 }
 
-// compareNewRows streams the new JSONL file and produces inserts/updates.
-func compareNewRows(db *sql.DB, newFilePath string, pkCols []string, result *ComparisonResult, seen map[string]struct{}) error {
-	f, err := os.Open(newFilePath)
-	if err != nil {
-		return err
+type batchItem struct {
+	pk   string
+	vals []string
+	hash []byte
+}
+
+// compareNewRows streams the new binary file and produces inserts/updates.
+func compareNewRows(db *sql.DB, r *bufio.Reader, columns []string, pkCols []string, result *ComparisonResult, seen map[string]struct{}, table string, fileSize int64) error {
+	pkIndex := buildPKIndex(columns, pkCols)
+	batchSize := adjustBatchByFileSize(sqliteBatchSize, fileSize)
+	if batchSize <= 0 {
+		batchSize = 512
 	}
-	defer f.Close()
-
-	getStmt, err := db.Prepare(`SELECT row_hash, row_json FROM rows WHERE pk_hash = ?`)
+	fullQuery := buildInQuery(batchSize)
+	fullStmt, err := db.Prepare(fullQuery)
 	if err != nil {
-		return fmt.Errorf("prepare lookup: %w", err)
+		return fmt.Errorf("prepare batch lookup: %w", err)
 	}
-	defer getStmt.Close()
+	defer fullStmt.Close()
 
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if strings.TrimSpace(line) == "" {
-			continue
+	items := make([]batchItem, 0, batchSize)
+	for {
+		values, err := readRowValues(r)
+		if err == io.EOF {
+			break
 		}
-		newRow, err := parser.FromJSON(line)
 		if err != nil {
-			return fmt.Errorf("parse json: %w", err)
+			return fmt.Errorf("read row: %w", err)
 		}
-		hash := hashPK(newRow, pkCols)
-		newHash := rowHash(newRow)
-
-		var oldHash []byte
-		var oldRowStr string
-		err = getStmt.QueryRow(hash).Scan(&oldHash, &oldRowStr)
-		if err == sql.ErrNoRows {
-			result.Changes += fmt.Sprintf("-- NEW RECORD IN %s\n", newRow.Table)
-			result.Changes += buildInsertStatement(newRow)
-			result.Changes += "\n\n"
-			result.InsertCount++
-			continue
-		} else if err != nil {
-			return fmt.Errorf("lookup: %w", err)
-		}
-
-		seen[hash] = struct{}{}
-		if bytes.Equal(oldHash, newHash) {
-			continue
-		}
-
-		oldRow, err := parser.FromJSON(oldRowStr)
-		if err != nil {
-			return fmt.Errorf("parse old json: %w", err)
-		}
-		updates := findUpdates(oldRow, newRow)
-		if len(updates) > 0 {
-			result.Changes += fmt.Sprintf("-- TABLE %s\n", newRow.Table)
-			for col, oldVal := range updates {
-				result.Changes += fmt.Sprintf("-- %s old value: %s\n", col, oldVal)
+		hash := hashPKValues(values, pkIndex)
+		newHash := rowHashValues(values, columns)
+		items = append(items, batchItem{pk: hash, vals: values, hash: newHash})
+		if len(items) >= batchSize {
+			if err := compareBatch(fullStmt, items, result, seen, pkCols, columns, table); err != nil {
+				return err
 			}
-			result.Changes += buildUpdateStatement(newRow.Table, newRow, pkCols, updates)
-			result.Changes += "\n\n"
-			result.UpdateCount++
+			items = items[:0]
 		}
 	}
-	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("scan new jsonl: %w", err)
+	if len(items) > 0 {
+		stmt, err := db.Prepare(buildInQuery(len(items)))
+		if err != nil {
+			return fmt.Errorf("prepare tail lookup: %w", err)
+		}
+		if err := compareBatch(stmt, items, result, seen, pkCols, columns, table); err != nil {
+			stmt.Close()
+			return err
+		}
+		stmt.Close()
 	}
 	return nil
 }
 
+func compareBatch(stmt *sql.Stmt, items []batchItem, result *ComparisonResult, seen map[string]struct{}, pkCols []string, columns []string, table string) error {
+	args := make([]any, 0, len(items))
+	for _, it := range items {
+		args = append(args, it.pk)
+	}
+	rows, err := stmt.Query(args...)
+	if err != nil {
+		return fmt.Errorf("batch lookup: %w", err)
+	}
+	defer rows.Close()
+	oldMap := make(map[string]struct {
+		hash []byte
+		row  []byte
+	}, len(items))
+	for rows.Next() {
+		var pk string
+		var h []byte
+		var rowBlob []byte
+		if err := rows.Scan(&pk, &h, &rowBlob); err != nil {
+			return fmt.Errorf("scan batch: %w", err)
+		}
+		oldMap[pk] = struct {
+			hash []byte
+			row  []byte
+		}{hash: h, row: rowBlob}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("batch rows: %w", err)
+	}
+	for _, it := range items {
+		if old, ok := oldMap[it.pk]; ok {
+			seen[it.pk] = struct{}{}
+			if bytes.Equal(old.hash, it.hash) {
+				continue
+			}
+			oldVals, err := decodeRowValues(old.row)
+			if err != nil {
+				return fmt.Errorf("decode old row: %w", err)
+			}
+			oldRow := buildRowFromValues(table, columns, oldVals)
+			newRow := buildRowFromValues(table, columns, it.vals)
+			updates := findUpdates(oldRow, newRow)
+			if len(updates) > 0 {
+				result.Changes += fmt.Sprintf("-- TABLE %s\n", newRow.Table)
+				for col, oldVal := range updates {
+					result.Changes += fmt.Sprintf("-- %s old value: %s\n", col, oldVal)
+				}
+				result.Changes += buildUpdateStatement(newRow.Table, newRow, pkCols, updates)
+				result.Changes += "\n\n"
+				result.UpdateCount++
+			}
+			continue
+		}
+		result.Changes += fmt.Sprintf("-- NEW RECORD IN %s\n", table)
+		result.Changes += buildInsertFromValues(table, columns, it.vals)
+		result.Changes += "\n\n"
+		result.InsertCount++
+	}
+	return nil
+}
+
+func buildInQuery(count int) string {
+	placeholders := make([]string, count)
+	for i := range placeholders {
+		placeholders[i] = "?"
+	}
+	return fmt.Sprintf("SELECT pk_hash, row_hash, row_blob FROM rows WHERE pk_hash IN (%s)", strings.Join(placeholders, ","))
+}
+
+func adjustBatchByFileSize(base int, fileSize int64) int {
+	if base <= 0 {
+		base = 512
+	}
+	mb := float64(fileSize) / (1024.0 * 1024.0)
+	switch {
+	case mb < 64:
+		return base
+	case mb < 256:
+		return max(64, base/2)
+	case mb < 1024:
+		return max(64, base/4)
+	case mb < 4096:
+		return max(64, base/8)
+	default:
+		return max(64, base/16)
+	}
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
 // emitDeletionsFromDB scans old rows and emits deletions for unseen PKs.
-func emitDeletionsFromDB(db *sql.DB, pkCols []string, seen map[string]struct{}, result *ComparisonResult) error {
-	rows, err := db.Query(`SELECT pk_hash, row_json FROM rows`)
+func emitDeletionsFromDB(db *sql.DB, pkCols []string, columns []string, table string, seen map[string]struct{}, result *ComparisonResult) error {
+	rows, err := db.Query(`SELECT pk_hash, row_blob FROM rows`)
 	if err != nil {
 		return fmt.Errorf("query rows: %w", err)
 	}
 	defer rows.Close()
 
 	for rows.Next() {
-		var hash, rowStr string
-		if err := rows.Scan(&hash, &rowStr); err != nil {
+		var hash string
+		var blob []byte
+		if err := rows.Scan(&hash, &blob); err != nil {
 			return fmt.Errorf("scan deletion: %w", err)
 		}
 		if _, ok := seen[hash]; ok {
 			continue
 		}
-		oldRow, err := parser.FromJSON(rowStr)
+		oldVals, err := decodeRowValues(blob)
 		if err != nil {
 			return fmt.Errorf("decode deletion row: %w", err)
 		}
-		result.Deletions += fmt.Sprintf("-- DELETED FROM %s: %s\n", oldRow.Table, hash)
-		result.Deletions += buildDeleteStatement(oldRow.Table, oldRow, pkCols)
+		oldRow := buildRowFromValues(table, columns, oldVals)
+		result.Deletions += fmt.Sprintf("-- DELETED FROM %s: %s\n", table, hash)
+		result.Deletions += buildDeleteStatement(table, oldRow, pkCols)
 		result.Deletions += "\n\n"
 		result.DeleteCount++
 	}
@@ -370,7 +691,7 @@ func setupSQLiteSchema(db *sql.DB) error {
 		`CREATE TABLE IF NOT EXISTS rows (
 			pk_hash TEXT PRIMARY KEY,
 			row_hash BLOB NOT NULL,
-			row_json TEXT NOT NULL
+			row_blob BLOB NOT NULL
 		);`,
 	}
 	for _, stmt := range stmts {
@@ -388,7 +709,7 @@ func beginSQLiteInsert(db *sql.DB) (*sql.Tx, *sql.Stmt, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	stmt, err := tx.Prepare(`INSERT OR REPLACE INTO rows(pk_hash, row_hash, row_json) VALUES(?, ?, ?)`)
+	stmt, err := tx.Prepare(`INSERT OR REPLACE INTO rows(pk_hash, row_hash, row_blob) VALUES(?, ?, ?)`)
 	if err != nil {
 		_ = tx.Rollback()
 		return nil, nil, err
@@ -405,23 +726,33 @@ func insertRowsToSQLite(db *sql.DB, insertParser *parser.InsertParser, filename 
 
 	batchCount := 0
 	var firstErr error
+	pkIndexCache := make(map[string][]int)
 
 	err = insertParser.ParseInsertsStream(filename, columns, p, "", func(row *parser.InsertRow) {
 		if firstErr != nil {
 			return
 		}
-		pkCols, hasPK := pkMap[row.Table]
+		resolved, ok := resolveTableName(pkMap, row.Table)
+		if !ok {
+			return
+		}
+		pkCols, hasPK := pkMap[resolved]
 		if !hasPK {
 			return
 		}
-		hash := hashPK(row, pkCols)
-		val, mErr := json.Marshal(row)
-		if mErr != nil {
-			firstErr = mErr
-			return
+		pkIndex, ok := pkIndexCache[resolved]
+		if !ok {
+			pkIndex = buildPKIndex(row.Columns, pkCols)
+			pkIndexCache[resolved] = pkIndex
 		}
-		rh := rowHash(row)
-		if _, e := stmt.Exec(hash, rh, string(val)); e != nil {
+		values := make([]string, 0, len(row.Columns))
+		for _, col := range row.Columns {
+			values = append(values, row.Data[col])
+		}
+		hash := hashPKValues(values, pkIndex)
+		rh := rowHashValues(values, row.Columns)
+		blob := encodeRowValues(values)
+		if _, e := stmt.Exec(hash, rh, blob); e != nil {
 			firstErr = e
 			return
 		}
@@ -498,9 +829,16 @@ func compareTableSQLite(table string, pkCols []string, oldFilePath, newFilePath 
 	}
 
 	// Load old rows into SQLite
+	var columns []string
 	if oldFilePath != "" {
 		start := time.Now()
-		if err := loadTableJSONL(db, oldFilePath, pkCols); err != nil {
+		cols, f, reader, err := openTableBin(oldFilePath)
+		if err != nil {
+			return nil, nil, err
+		}
+		defer f.Close()
+		columns = cols
+		if err := loadTableBin(db, reader, columns, pkCols); err != nil {
 			return nil, nil, err
 		}
 		timing.LoadMS = time.Since(start).Milliseconds()
@@ -511,10 +849,28 @@ func compareTableSQLite(table string, pkCols []string, oldFilePath, newFilePath 
 
 	seen := make(map[string]struct{})
 
+	if len(columns) == 0 && newFilePath != "" {
+		cols, f, _, err := openTableBin(newFilePath)
+		if err != nil {
+			return nil, nil, err
+		}
+		f.Close()
+		columns = cols
+	}
+
 	// Process new rows
 	if newFilePath != "" {
 		start := time.Now()
-		if err := compareNewRows(db, newFilePath, pkCols, result, seen); err != nil {
+		_, f, reader, err := openTableBin(newFilePath)
+		if err != nil {
+			return nil, nil, err
+		}
+		defer f.Close()
+		fileSize := int64(0)
+		if info, err := os.Stat(newFilePath); err == nil {
+			fileSize = info.Size()
+		}
+		if err := compareNewRows(db, reader, columns, pkCols, result, seen, table, fileSize); err != nil {
 			return nil, nil, err
 		}
 		timing.CompMS = time.Since(start).Milliseconds()
@@ -525,7 +881,7 @@ func compareTableSQLite(table string, pkCols []string, oldFilePath, newFilePath 
 
 	// Deletions
 	start := time.Now()
-	if err := emitDeletionsFromDB(db, pkCols, seen, result); err != nil {
+	if err := emitDeletionsFromDB(db, pkCols, columns, table, seen, result); err != nil {
 		return nil, nil, err
 	}
 	timing.DelMS = time.Since(start).Milliseconds()
@@ -575,7 +931,7 @@ func NewDeltaGenerator(pkMap, oldColumnsMap, newColumnsMap map[string][]string) 
 }
 
 // GenerateDelta is the high-level pipeline:
-// 1) split dumps into per-table JSONL files
+// 1) split dumps into per-table binary files
 // 2) compare tables in parallel using per-table SQLite DBs
 // 3) stream SQL output and return summary counts
 func (dg *DeltaGenerator) GenerateDelta(oldFile, newFile string, p *mpb.Progress, out io.Writer) (Summary, *TimingMeta, error) {
@@ -594,7 +950,7 @@ func (dg *DeltaGenerator) GenerateDelta(oldFile, newFile string, p *mpb.Progress
 	fmt.Fprintln(out, "SET FOREIGN_KEY_CHECKS = 0;")
 	fmt.Fprintln(out)
 
-	// Split dumps into per-table JSONL files
+	// Split dumps into per-table binary files
 	logger.Debug("GenerateDelta: Splitting dumps by table")
 	splitStart := time.Now()
 	oldTableFiles := make(map[string]string)
@@ -792,7 +1148,7 @@ func hashPK(row *parser.InsertRow, pkCols []string) string {
 		parts = append(parts, normalizeNull(val))
 	}
 	data := strings.Join(parts, "|")
-	hash := sha256.Sum256([]byte(data))
+	hash := blake3.Sum256([]byte(data))
 	return hex.EncodeToString(hash[:])
 }
 
