@@ -140,7 +140,7 @@ public class SqlDumpDiff {
 
             DeltaGenerator generator = new DeltaGenerator();
             SqliteProfilesFile profiles = SqliteProfileLoader.load(java.nio.file.Path.of(sqliteProfileFile));
-            SqliteProfile profile = profiles != null ? profiles.profiles().get(sqliteProfile) : null;
+            SqliteProfile profile = profiles != null ? profiles.getProfiles().get(sqliteProfile) : null;
             if (profile == null) {
                 throw new IllegalArgumentException("Invalid --sqlite-profile: " + sqliteProfile);
             }

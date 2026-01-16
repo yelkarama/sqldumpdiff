@@ -66,6 +66,11 @@ public class TableComparer {
             if (comparison.newFile() != null && Files.exists(comparison.newFile())) {
                 long start = System.nanoTime();
                 try (BufferedReader reader = Files.newBufferedReader(comparison.newFile())) {
+                    long fileSize = Files.size(comparison.newFile());
+                    int baseBatch = profile != null ? profile.batch() : 1000;
+                    int batchSize = adjustBatchByFileSize(baseBatch, fileSize);
+                    List<String> pkBatch = new ArrayList<>(batchSize);
+                    List<InsertRow> rowBatch = new ArrayList<>(batchSize);
                     String line;
                     while ((line = reader.readLine()) != null) {
                         if (line.trim().isEmpty()) {
@@ -75,51 +80,22 @@ public class TableComparer {
                         InsertRow newRow = InsertRow.fromJson(line, comparison.tableName());
                         List<String> pkValues = getPkValues(newRow, comparison.pkColumns());
                         String pkHash = SQLiteTableStore.hashPrimaryKeyValues(pkValues);
+                        pkBatch.add(pkHash);
+                        rowBatch.add(newRow);
 
-                        // Query SQLite for old record matching this PK
-                        Map<String, String> oldData = oldStore.getRowData(pkHash);
-
-                        if (oldData == null) {
-                            // New record
-                            changes.append("-- NEW RECORD IN ").append(comparison.tableName()).append("\n");
-                            changes.append(newRow.statement()).append("\n\n");
-                            insertCount++;
-                            continue;
+                        if (pkBatch.size() >= batchSize) {
+                            int[] counts = updateCounts(comparison, oldStore, pkBatch, rowBatch, changes,
+                                    matchedOld);
+                            insertCount += counts[0];
+                            updateCount += counts[1];
+                            pkBatch.clear();
+                            rowBatch.clear();
                         }
-
-                        matchedOld.add(pkHash);
-
-                        // Check for updates
-                        List<String> updates = new ArrayList<>();
-                        List<String> comments = new ArrayList<>();
-
-                        for (String col : newRow.columns()) {
-                            String oldVal = normalizeNull(oldData.get(col));
-                            String newVal = normalizeNull(newRow.data().get(col));
-
-                            if (!Objects.equals(oldVal, newVal)) {
-                                comments.add("-- " + col + " old value: " + oldData.get(col));
-
-                                if (newVal == null) {
-                                    updates.add("`" + col + "`=NULL");
-                                } else {
-                                    String escaped = newVal.replace("'", "''");
-                                    updates.add("`" + col + "`='" + escaped + "'");
-                                }
-                            }
-                        }
-
-                        if (!updates.isEmpty()) {
-                            for (String comment : comments) {
-                                changes.append(comment).append("\n");
-                            }
-
-                            String whereClause = buildWhereClause(comparison.pkColumns(), newRow.data());
-                            changes.append("UPDATE `").append(comparison.tableName()).append("` SET ");
-                            changes.append(String.join(", ", updates));
-                            changes.append(" WHERE ").append(whereClause).append(";\n\n");
-                            updateCount++;
-                        }
+                    }
+                    if (!pkBatch.isEmpty()) {
+                        int[] counts = updateCounts(comparison, oldStore, pkBatch, rowBatch, changes, matchedOld);
+                        insertCount += counts[0];
+                        updateCount += counts[1];
                     }
                 }
                 compareMs = (System.nanoTime() - start) / 1_000_000L;
@@ -190,6 +166,72 @@ public class TableComparer {
             result.add(row.data().get(col));
         }
         return result;
+    }
+
+    private int[] updateCounts(TableComparison comparison, SQLiteTableStore oldStore, List<String> pkBatch,
+            List<InsertRow> rowBatch, StringBuilder changes, Set<String> matchedOld) throws SQLException {
+        int insertCount = 0;
+        int updateCount = 0;
+        Map<String, Map<String, String>> oldDataBatch = oldStore.getRowDataBatch(pkBatch);
+        for (int i = 0; i < rowBatch.size(); i++) {
+            InsertRow newRow = rowBatch.get(i);
+            String pkHash = pkBatch.get(i);
+            Map<String, String> oldData = oldDataBatch.get(pkHash);
+            if (oldData == null) {
+                changes.append("-- NEW RECORD IN ").append(comparison.tableName()).append("\n");
+                changes.append(newRow.statement()).append("\n\n");
+                insertCount++;
+                continue;
+            }
+            matchedOld.add(pkHash);
+
+            List<String> updates = new ArrayList<>();
+            List<String> comments = new ArrayList<>();
+            for (String col : newRow.columns()) {
+                String oldVal = normalizeNull(oldData.get(col));
+                String newVal = normalizeNull(newRow.data().get(col));
+                if (!Objects.equals(oldVal, newVal)) {
+                    comments.add("-- " + col + " old value: " + oldData.get(col));
+                    if (newVal == null) {
+                        updates.add("`" + col + "`=NULL");
+                    } else {
+                        String escaped = newVal.replace("'", "''");
+                        updates.add("`" + col + "`='" + escaped + "'");
+                    }
+                }
+            }
+            if (!updates.isEmpty()) {
+                for (String comment : comments) {
+                    changes.append(comment).append("\n");
+                }
+                String whereClause = buildWhereClause(comparison.pkColumns(), newRow.data());
+                changes.append("UPDATE `").append(comparison.tableName()).append("` SET ");
+                changes.append(String.join(", ", updates));
+                changes.append(" WHERE ").append(whereClause).append(";\n\n");
+                updateCount++;
+            }
+        }
+        return new int[] { insertCount, updateCount };
+    }
+
+    private int adjustBatchByFileSize(int base, long sizeBytes) {
+        if (base <= 0) {
+            base = 1000;
+        }
+        double mb = sizeBytes / (1024.0 * 1024.0);
+        int scaled;
+        if (mb < 64) {
+            scaled = base;
+        } else if (mb < 256) {
+            scaled = Math.max(64, base / 2);
+        } else if (mb < 1024) {
+            scaled = Math.max(64, base / 4);
+        } else if (mb < 4096) {
+            scaled = Math.max(64, base / 8);
+        } else {
+            scaled = Math.max(64, base / 16);
+        }
+        return scaled;
     }
 
     private String normalizeNull(String val) {

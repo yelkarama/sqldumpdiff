@@ -4,8 +4,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
+import java.nio.charset.StandardCharsets;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
@@ -16,6 +15,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import org.apache.commons.codec.digest.Blake3;
 
 /**
  * Stores table rows in SQLite for memory-efficient comparison.
@@ -114,6 +114,35 @@ public class SQLiteTableStore {
         return null;
     }
 
+    public Map<String, Map<String, String>> getRowDataBatch(List<String> pkHashes) throws SQLException {
+        if (pkHashes == null || pkHashes.isEmpty()) {
+            return Map.of();
+        }
+        StringBuilder placeholders = new StringBuilder();
+        for (int i = 0; i < pkHashes.size(); i++) {
+            if (i > 0) {
+                placeholders.append(",");
+            }
+            placeholders.append("?");
+        }
+        String sql = "SELECT pk_hash, data FROM rows WHERE pk_hash IN (" + placeholders + ")";
+        Map<String, Map<String, String>> result = new java.util.HashMap<>();
+        try (PreparedStatement stmt = connection.prepareStatement(sql)) {
+            for (int i = 0; i < pkHashes.size(); i++) {
+                stmt.setString(i + 1, pkHashes.get(i));
+            }
+            try (ResultSet rs = stmt.executeQuery()) {
+                while (rs.next()) {
+                    String pk = rs.getString("pk_hash");
+                    String json = rs.getString("data");
+                    InsertRow row = InsertRow.fromJson(json, tableName);
+                    result.put(pk, row.data());
+                }
+            }
+        }
+        return result;
+    }
+
     public Set<String> getAllPkHashes() throws SQLException {
         Set<String> hashes = new HashSet<>();
         String sql = "SELECT pk_hash FROM rows";
@@ -162,37 +191,29 @@ public class SQLiteTableStore {
     }
 
     private String hashPrimaryKey(InsertRow row, List<String> pkColumns) {
-        // Use SHA256 hash of PK values to avoid collisions
+        // Use BLAKE3 hash of PK values to avoid collisions
         // This keeps the key small even with large PK values
         StringBuilder sb = new StringBuilder();
         for (String col : pkColumns) {
             String val = row.data().get(col);
             sb.append(val == null ? "NULL" : val).append("|");
         }
-        return sha256(sb.toString());
+        return blake3Hex(sb.toString());
     }
 
     public static String hashPrimaryKeyValues(List<String> pkValues) {
-        // Use SHA256 hash of PK values
+        // Use BLAKE3 hash of PK values
         StringBuilder sb = new StringBuilder();
         for (String val : pkValues) {
             sb.append(val == null ? "NULL" : val).append("|");
         }
-        return sha256(sb.toString());
+        return blake3Hex(sb.toString());
     }
 
-    private static final ThreadLocal<MessageDigest> SHA256 = ThreadLocal.withInitial(() -> {
-        try {
-            return MessageDigest.getInstance("SHA-256");
-        } catch (NoSuchAlgorithmException e) {
-            throw new RuntimeException("SHA-256 not available", e);
-        }
-    });
-
-    private static String sha256(String input) {
-        MessageDigest digest = SHA256.get();
-        digest.reset();
-        byte[] hash = digest.digest(input.getBytes());
+    private static String blake3Hex(String input) {
+        Blake3 hasher = Blake3.initHash();
+        hasher.update(input.getBytes(StandardCharsets.UTF_8));
+        byte[] hash = hasher.doFinalize(32);
         StringBuilder hexString = new StringBuilder(hash.length * 2);
         for (byte b : hash) {
             String hex = Integer.toHexString(0xff & b);

@@ -33,6 +33,13 @@
             <version>1.14.1</version>
         </dependency>
 
+        <!-- Apache Commons Codec for BLAKE3 hashing -->
+        <dependency>
+            <groupId>commons-codec</groupId>
+            <artifactId>commons-codec</artifactId>
+            <version>1.20.0</version>
+        </dependency>
+
         <!-- Progress bar for console feedback -->
         <dependency>
             <groupId>me.tongfei</groupId>
