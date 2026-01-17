@@ -110,6 +110,16 @@ public class SqlDumpDiff {
         // Configure logging based on debug flag (before any logging happens)
         configureLogging(debug);
 
+        // Emit BLAKE3 native status once at startup.
+        if (Blake3Hasher.debugNativeStatus()) {
+            System.err.println("[INFO] BLAKE3 native: enabled (libblake3)");
+        } else {
+            System.err.println("[INFO] BLAKE3 native: fallback (pure Java)");
+            System.err.println("[INFO] java.library.path=" + System.getProperty("java.library.path"));
+            System.err.println("[INFO] blake3.path=" + System.getProperty("blake3.path"));
+            System.err.println("[INFO] blake3.native.error=" + Blake3Hasher.nativeError());
+        }
+
         if (positional.size() < 2) {
             System.err.println("Usage: sqldumpdiff [--debug] [--timing] [--timing-json <file>] <old_dump.sql> <new_dump.sql> [output.sql]");
             System.err.println();

@@ -1,10 +1,10 @@
 package com.sqldumpdiff;
 
 import java.io.IOException;
-import java.io.EOFException;
 import java.io.RandomAccessFile;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -14,16 +14,21 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
-import org.apache.commons.codec.binary.Hex;
-import org.apache.commons.codec.digest.Blake3;
-
 /**
  * Stores table rows in a binary file under /tmp and keeps an in-memory index
  * from PK hash to file offset. This replaces the SQLite store.
  */
 public class BinaryTableStore implements AutoCloseable {
+    private static final int WRITE_BUFFER_BYTES = 4 * 1024 * 1024;
+    private static final ThreadLocal<StringBuilder> TL_SB = ThreadLocal.withInitial(StringBuilder::new);
+    private static final ThreadLocal<java.io.ByteArrayOutputStream> TL_BAOS = ThreadLocal
+            .withInitial(() -> new java.io.ByteArrayOutputStream(256));
     private final Path filePath;
     private final FileChannel channel;
+    private MappedByteBuffer mmap;
+    private final ByteBuffer writeBuffer;
+    private long writeBufStart;
+    private long writePos;
     private final Map<String, Long> index = new HashMap<>();
     private final List<String> columns;
     private final List<String> pkColumns;
@@ -32,32 +37,71 @@ public class BinaryTableStore implements AutoCloseable {
         this.columns = columns;
         this.pkColumns = pkColumns;
         this.filePath = Files.createTempFile("sqldumpdiff_store_" + table + "_", ".bin");
-        this.channel = new RandomAccessFile(filePath.toFile(), "rw").getChannel();
+        RandomAccessFile raf = new RandomAccessFile(filePath.toFile(), "rw");
+        this.channel = raf.getChannel();
+        this.writeBuffer = ByteBuffer.allocate(WRITE_BUFFER_BYTES).order(ByteOrder.LITTLE_ENDIAN);
+        this.writeBufStart = 0L;
+        this.writePos = 0L;
     }
 
     public void insertRow(InsertRow row) throws IOException {
         String pkHash = hashPrimaryKey(row, pkColumns);
         byte[] rowHash = hashRow(row, columns);
         byte[] blob = encodeRowValues(row, columns);
-        long offset = channel.position();
+        long offset = writePos;
         index.put(pkHash, offset);
 
-        ByteBuffer header = ByteBuffer.allocate(36).order(ByteOrder.LITTLE_ENDIAN);
-        header.put(rowHash);
-        header.putInt(blob.length);
-        header.flip();
-        writeFully(channel, header);
-        if (blob.length > 0) {
-            writeFully(channel, ByteBuffer.wrap(blob));
+        int recordSize = 36 + blob.length;
+        if (recordSize > writeBuffer.capacity()) {
+            flushBuffer();
+            ByteBuffer header = ByteBuffer.allocate(36).order(ByteOrder.LITTLE_ENDIAN);
+            header.put(rowHash);
+            header.putInt(blob.length);
+            header.flip();
+            writeFully(channel, header, writePos);
+            if (blob.length > 0) {
+                writeFully(channel, ByteBuffer.wrap(blob), writePos + 36);
+            }
+            writePos += recordSize;
+            return;
         }
+        if (writeBuffer.remaining() < recordSize) {
+            flushBuffer();
+        }
+        writeBuffer.put(rowHash);
+        writeBuffer.putInt(blob.length);
+        if (blob.length > 0) {
+            writeBuffer.put(blob);
+        }
+        writePos += recordSize;
     }
 
     public void executeBatch() throws IOException {
+        flushBuffer();
         channel.force(false);
     }
 
     public void analyzeForQuery() {
         // no-op for binary store
+    }
+
+    public void enableMmap() {
+        try {
+            flushBuffer();
+        } catch (IOException ignored) {
+        }
+        String os = System.getProperty("os.name", "").toLowerCase();
+        if (os.contains("win")) {
+            return;
+        }
+        try {
+            long size = channel.size();
+            if (size > 0 && size <= Integer.MAX_VALUE) {
+                mmap = channel.map(FileChannel.MapMode.READ_ONLY, 0, size);
+            }
+        } catch (IOException ignored) {
+            mmap = null;
+        }
     }
 
     public long getRowCount() {
@@ -68,7 +112,11 @@ public class BinaryTableStore implements AutoCloseable {
         return index.keySet();
     }
 
-    public Map<String, String> getRowData(String pkHash) throws IOException {
+    public List<String> getColumns() {
+        return columns;
+    }
+
+    public String[] getRowData(String pkHash) throws IOException {
         Long offset = index.get(pkHash);
         if (offset == null) {
             return null;
@@ -76,10 +124,10 @@ public class BinaryTableStore implements AutoCloseable {
         return readRowAt(offset);
     }
 
-    public Map<String, Map<String, String>> getRowDataBatch(List<String> pkHashes) throws IOException {
-        Map<String, Map<String, String>> out = new HashMap<>();
+    public Map<String, String[]> getRowDataBatch(List<String> pkHashes) throws IOException {
+        Map<String, String[]> out = new HashMap<>();
         for (String pkHash : pkHashes) {
-            Map<String, String> row = getRowData(pkHash);
+            String[] row = getRowData(pkHash);
             if (row != null) {
                 out.put(pkHash, row);
             }
@@ -87,7 +135,28 @@ public class BinaryTableStore implements AutoCloseable {
         return out;
     }
 
-    private Map<String, String> readRowAt(long offset) throws IOException {
+    private String[] readRowAt(long offset) throws IOException {
+        if (mmap != null) {
+            if (offset + 36 > mmap.limit()) {
+                throw new IOException("row blob invalid length");
+            }
+            for (int i = 0; i < 32; i++) {
+                mmap.get((int) offset + i);
+            }
+            int len = readIntLE(mmap, (int) offset + 32);
+            int blobStart = (int) offset + 36;
+            int blobEnd = blobStart + len;
+            if (len < 0 || blobEnd > mmap.limit()) {
+                throw new IOException("row blob invalid length");
+            }
+            byte[] blob = new byte[len];
+            if (len > 0) {
+                for (int i = 0; i < len; i++) {
+                    blob[i] = mmap.get(blobStart + i);
+                }
+            }
+            return decodeRowValues(blob, columns);
+        }
         ByteBuffer header = ByteBuffer.allocate(36).order(ByteOrder.LITTLE_ENDIAN);
         readFully(channel, header, offset);
         header.flip();
@@ -103,8 +172,7 @@ public class BinaryTableStore implements AutoCloseable {
         if (len > 0) {
             buf.get(blob);
         }
-        Map<String, String> data = decodeRowValues(blob, columns);
-        return data;
+        return decodeRowValues(blob, columns);
     }
 
     private static void readFully(FileChannel ch, ByteBuffer buf, long offset) throws IOException {
@@ -121,9 +189,11 @@ public class BinaryTableStore implements AutoCloseable {
         }
     }
 
-    private static void writeFully(FileChannel ch, ByteBuffer buf) throws IOException {
+    private static void writeFully(FileChannel ch, ByteBuffer buf, long offset) throws IOException {
+        long pos = offset;
         while (buf.hasRemaining()) {
-            ch.write(buf);
+            int written = ch.write(buf, pos);
+            pos += written;
         }
     }
 
@@ -147,14 +217,14 @@ public class BinaryTableStore implements AutoCloseable {
         return buf.array();
     }
 
-    private static Map<String, String> decodeRowValues(byte[] buf, List<String> columns) throws IOException {
+    private static String[] decodeRowValues(byte[] buf, List<String> columns) throws IOException {
         if (buf.length < 4) {
             throw new IOException("row blob too small");
         }
         int pos = 0;
         int count = readIntLE(buf, pos);
         pos += 4;
-        Map<String, String> data = new HashMap<>(columns.size());
+        String[] data = new String[columns.size()];
         int min = Math.min(count, columns.size());
         for (int i = 0; i < min; i++) {
             if (pos + 4 > buf.length) {
@@ -170,7 +240,7 @@ public class BinaryTableStore implements AutoCloseable {
                 System.arraycopy(buf, pos, b, 0, len);
                 pos += len;
             }
-            data.put(columns.get(i), len == 0 ? null : new String(b, StandardCharsets.UTF_8));
+            data[i] = len == 0 ? null : new String(b, StandardCharsets.UTF_8);
         }
         for (int i = min; i < count; i++) {
             if (pos + 4 > buf.length) {
@@ -183,9 +253,6 @@ public class BinaryTableStore implements AutoCloseable {
             }
             pos += len;
         }
-        for (int i = data.size(); i < columns.size(); i++) {
-            data.put(columns.get(i), null);
-        }
         return data;
     }
 
@@ -196,8 +263,16 @@ public class BinaryTableStore implements AutoCloseable {
                 | (buf[pos] & 0xFF);
     }
 
+    private static int readIntLE(MappedByteBuffer buf, int pos) {
+        return ((buf.get(pos + 3) & 0xFF) << 24)
+                | ((buf.get(pos + 2) & 0xFF) << 16)
+                | ((buf.get(pos + 1) & 0xFF) << 8)
+                | (buf.get(pos) & 0xFF);
+    }
+
     private static String hashPrimaryKey(InsertRow row, List<String> pkColumns) {
-        StringBuilder sb = new StringBuilder();
+        StringBuilder sb = TL_SB.get();
+        sb.setLength(0);
         for (String col : pkColumns) {
             String val = row.data().get(col);
             sb.append(val == null ? "NULL" : val).append("|");
@@ -206,7 +281,8 @@ public class BinaryTableStore implements AutoCloseable {
     }
 
     public static String hashPrimaryKeyValues(List<String> pkValues) {
-        StringBuilder sb = new StringBuilder();
+        StringBuilder sb = TL_SB.get();
+        sb.setLength(0);
         for (String val : pkValues) {
             sb.append(val == null ? "NULL" : val).append("|");
         }
@@ -214,26 +290,24 @@ public class BinaryTableStore implements AutoCloseable {
     }
 
     private static byte[] hashRow(InsertRow row, List<String> columns) {
-        Blake3 hasher = Blake3.initHash();
+        java.io.ByteArrayOutputStream out = TL_BAOS.get();
+        out.reset();
         for (String col : columns) {
-            hasher.update(col.toLowerCase().getBytes(StandardCharsets.UTF_8));
-            hasher.update("=".getBytes(StandardCharsets.UTF_8));
+            out.writeBytes(col.toLowerCase().getBytes(StandardCharsets.UTF_8));
+            out.writeBytes("=".getBytes(StandardCharsets.UTF_8));
             String val = row.data().get(col);
             String norm = normalizeNull(val);
             if (norm == null) {
                 norm = "NULL";
             }
-            hasher.update(norm.getBytes(StandardCharsets.UTF_8));
-            hasher.update(";".getBytes(StandardCharsets.UTF_8));
+            out.writeBytes(norm.getBytes(StandardCharsets.UTF_8));
+            out.writeBytes(";".getBytes(StandardCharsets.UTF_8));
         }
-        return hasher.doFinalize(32);
+        return Blake3Hasher.hashBytes(out.toByteArray());
     }
 
     private static String blake3Hex(String input) {
-        Blake3 hasher = Blake3.initHash();
-        hasher.update(input.getBytes(StandardCharsets.UTF_8));
-        byte[] hash = hasher.doFinalize(32);
-        return Hex.encodeHexString(hash);
+        return Blake3Hasher.hashHex(input);
     }
 
     private static String normalizeNull(String val) {
@@ -253,7 +327,18 @@ public class BinaryTableStore implements AutoCloseable {
 
     @Override
     public void close() throws IOException {
+        flushBuffer();
         channel.close();
         Files.deleteIfExists(filePath);
+    }
+
+    private void flushBuffer() throws IOException {
+        if (writeBuffer.position() == 0) {
+            return;
+        }
+        writeBuffer.flip();
+        writeFully(channel, writeBuffer, writeBufStart);
+        writeBufStart = writePos;
+        writeBuffer.clear();
     }
 }

@@ -209,6 +209,71 @@ public class InsertParser {
         return results;
     }
 
+    /**
+     * Expand a multi-row INSERT statement into value-only rows.
+     * Avoids per-row Map allocation during splitting.
+     */
+    public List<ValueRow> expandInsertValues(String insertStmt, Map<String, List<String>> columnsMap) {
+        String normalized = insertStmt.replaceAll("\\s+", " ").trim();
+
+        Matcher tableMatcher = INSERT_START.matcher(normalized);
+        if (!tableMatcher.find()) {
+            return List.of();
+        }
+        String table = tableMatcher.group(1);
+
+        List<String> columns;
+        int valuesStartPos;
+
+        Matcher colMatcher = COLUMNS_LIST.matcher(normalized);
+        if (colMatcher.find()) {
+            String colsStr = colMatcher.group(1);
+            columns = Arrays.stream(colsStr.split(","))
+                    .map(col -> col.trim().replaceAll("[`'\"]", ""))
+                    .toList();
+            valuesStartPos = colMatcher.end();
+        } else {
+            columns = columnsMap.get(table);
+            int valuesIdx = normalized.toUpperCase().indexOf("VALUES");
+            if (valuesIdx == -1) {
+                return List.of();
+            }
+            valuesStartPos = valuesIdx + 6; // len("VALUES")
+        }
+
+        if (columns == null || columns.isEmpty()) {
+            return List.of();
+        }
+
+        String valuesPart = normalized.substring(valuesStartPos).trim();
+        if (valuesPart.endsWith(";")) {
+            valuesPart = valuesPart.substring(0, valuesPart.length() - 1);
+        }
+
+        if (valuesPart.isEmpty()) {
+            return List.of();
+        }
+
+        List<String> groups = splitValueGroups(valuesPart);
+        List<ValueRow> results = new ArrayList<>();
+
+        for (String group : groups) {
+            String inner = group.trim();
+            if (inner.startsWith("(") && inner.endsWith(")")) {
+                inner = inner.substring(1, inner.length() - 1);
+            }
+
+            List<String> values = parseValues(inner);
+            if (values.size() != columns.size()) {
+                continue; // Skip malformed row
+            }
+
+            results.add(new ValueRow(table, columns, values));
+        }
+
+        return results;
+    }
+
     private List<String> splitValueGroups(String valuesPart) {
         List<String> groups = new ArrayList<>();
         StringBuilder buf = new StringBuilder();

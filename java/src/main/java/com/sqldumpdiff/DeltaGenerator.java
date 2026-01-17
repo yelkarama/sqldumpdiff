@@ -235,6 +235,7 @@ public class DeltaGenerator {
         Map<String, TableBinIO.TableBinWriter> writers = new HashMap<>();
         Map<String, Path> tablePaths = new HashMap<>();
         Map<String, Long> rowCounts = new HashMap<>();
+        Map<String, int[]> pkIndexes = new HashMap<>();
         long bytesRead = 0;
 
         try (BufferedReader reader = Files.newBufferedReader(dumpFile)) {
@@ -244,16 +245,23 @@ public class DeltaGenerator {
                     progressBar.stepTo(Math.min(bytesRead, progressBar.getMax()));
                 }
 
-                List<InsertRow> rows = parser.expandInsert(insertStmt, columnsMap);
+                List<ValueRow> rows = parser.expandInsertValues(insertStmt, columnsMap);
 
-                for (InsertRow row : rows) {
+                for (ValueRow row : rows) {
                     if (!pkMap.containsKey(row.table())) {
                         continue;
                     }
 
                     List<String> pkCols = pkMap.get(row.table());
-                    boolean hasAllPkCols = pkCols.stream()
-                            .allMatch(col -> row.data().containsKey(col));
+                    int[] idx = pkIndexes.computeIfAbsent(row.table(),
+                            t -> buildPkIndexes(pkCols, row.columns()));
+                    boolean hasAllPkCols = true;
+                    for (int i : idx) {
+                        if (i < 0 || i >= row.values().size()) {
+                            hasAllPkCols = false;
+                            break;
+                        }
+                    }
 
                     if (!hasAllPkCols) {
                         continue;
@@ -272,7 +280,7 @@ public class DeltaGenerator {
                                 new Object[] { label, row.table() });
                     }
 
-                    writers.get(row.table()).writeRow(row.data());
+                    writers.get(row.table()).writeRowValues(row.values());
                     rowCounts.put(row.table(), rowCounts.get(row.table()) + 1);
                 }
             }
@@ -316,6 +324,14 @@ public class DeltaGenerator {
                     new ComparisonResult(comparison.tableName(), "", "", 0, 0, 0),
                     new TableTiming(comparison.tableName(), 0, 0, 0));
         }
+    }
+
+    private int[] buildPkIndexes(List<String> pkColumns, List<String> columns) {
+        int[] idx = new int[pkColumns.size()];
+        for (int i = 0; i < pkColumns.size(); i++) {
+            idx[i] = columns.indexOf(pkColumns.get(i));
+        }
+        return idx;
     }
 
     private WriteTiming writeDeltaScript(List<ComparisonResult> results, String outputPath, ProgressBar progressBar)

@@ -124,6 +124,15 @@ public final class TableBinIO {
             }
         }
 
+        public void writeRowValues(List<String> values) throws IOException {
+            writeU32(out, columns.size());
+            for (int i = 0; i < columns.size(); i++) {
+                String val = i < values.size() ? values.get(i) : null;
+                byte[] bytes = val == null ? new byte[0] : val.getBytes(StandardCharsets.UTF_8);
+                writeBytes(out, bytes);
+            }
+        }
+
         @Override
         public void close() throws IOException {
             out.close();
